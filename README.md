@@ -17,5 +17,5 @@ Designed for any **Ubuntu / Mint / Debian-based distro**.
 ## 🔧 Installation
 
 ```bash
-chmod +x install-tv.sh
-./install-tv.sh
+chmod +x install-tv-1.0.sh
+./install-tv-1.0.sh
