@@ -1,0 +1,325 @@
+mkdir -p "$HOME/.local/bin"
+
+cat > "$HOME/.local/bin/tv" << 'EOF'
+#!/usr/bin/env bash
+#
+# tv v2.5 (apt-only, dead simple)
+# - 1) Main (US)
+# - 2) Global by language (All / Eng / Spa / ...)
+# - 3) Search global by name
+# - 4) Update playlists
+# - Clean numbering using NR, no fancy formatting
+
+set -e
+
+TV_DIR="$HOME/TV"
+MAIN_PLAYLIST="$TV_DIR/main.m3u"
+GLOBAL_INDEX="$TV_DIR/global-index.m3u"
+
+MAIN_URL="https://iptv-org.github.io/iptv/countries/us.m3u"
+GLOBAL_INDEX_URL="https://iptv-org.github.io/iptv/index.m3u"
+
+mkdir -p "$TV_DIR"
+
+ensure_playlist() {
+  local file="$1"
+  local url="$2"
+  local label="$3"
+
+  if [ ! -f "$file" ] || [ ! -s "$file" ]; then
+    echo ">>> Downloading $label playlist..."
+    if ! curl -L "$url" -o "$file"; then
+      echo "❌ Failed to download $label playlist."
+      exit 1
+    fi
+  fi
+}
+
+update_playlists() {
+  echo "⟳ Updating MAIN (US) playlist..."
+  if curl -L "$MAIN_URL" -o "$MAIN_PLAYLIST"; then
+    echo "✔ Main updated."
+  else
+    echo "❌ Failed to update main playlist."
+  fi
+
+  echo "⟳ Updating GLOBAL index (10k+ channels)..."
+  if curl -L "$GLOBAL_INDEX_URL" -o "$GLOBAL_INDEX"; then
+    echo "✔ Global index updated."
+  else
+    echo "❌ Failed to update global index."
+  fi
+
+  read -rp "Press ENTER to return to menu..." _
+}
+
+# Build: name \t url  (no genres, no tricks)
+build_tmp_from_playlist() {
+  local src="$1"
+  local tmp="$2"
+
+  awk -v OFS='\t' '
+    BEGIN { name="" }
+    /^#EXTINF/{
+      name = $0
+      sub(/.*,/, "", name)
+      next
+    }
+    /^https?:\/\//{
+      if (name == "") name = "Unknown"
+      print name, $0
+      name = ""
+    }
+  ' "$src" > "$tmp"
+}
+
+# Generic numbered menu: name \t url
+tv_menu_from_tmp() {
+  local tmp="$1"
+  local label="$2"
+
+  if [ ! -s "$tmp" ]; then
+    echo "❌ No channels found in $label."
+    read -rp "Press ENTER to return..." _
+    return
+  fi
+
+  while true; do
+    clear
+    echo "==================== TV CHANNELS (${label}) ===================="
+    echo " Type a number → channel plays in MPV"
+    echo " After it closes → list appears again"
+    echo ' Press ENTER with no input to go back'
+    echo "==============================================================="
+    echo
+
+    awk -F'\t' '{ printf "%4d. %s\n", NR, $1 }' "$tmp" | head -n 1000
+    echo
+    read -rp "Channel #: " CH
+
+    [ -z "$CH" ] && break
+    printf '%s\n' "$CH" | grep -Eq '^[0-9]+$' || { echo "Numbers only"; sleep 1; continue; }
+
+    local_url="$(awk -F'\t' -v i="$CH" 'NR==i{print $2}' "$tmp")"
+    local_name="$(awk -F'\t' -v i="$CH" 'NR==i{print $1}' "$tmp")"
+
+    if [ -z "$local_url" ]; then
+      echo "Invalid channel #"
+      sleep 1
+      continue
+    fi
+
+    echo
+    echo "▶ Playing #$CH: $local_name"
+    echo
+
+    mpv --title="CH $CH - $local_name" "$local_url"
+  done
+}
+
+tv_main() {
+  ensure_playlist "$MAIN_PLAYLIST" "$MAIN_URL" "main (US)"
+  command -v mpv >/dev/null || { echo "❌ mpv not installed"; read -rp "Press ENTER..." _; return; }
+
+  local TMP
+  TMP="$(mktemp)"
+  build_tmp_from_playlist "$MAIN_PLAYLIST" "$TMP"
+  tv_menu_from_tmp "$TMP" "MAIN (US)"
+  rm -f "$TMP"
+}
+
+tv_global_language() {
+  command -v mpv >/dev/null || { echo "❌ mpv not installed"; read -rp "Press ENTER..." _; return; }
+
+  while true; do
+    clear
+    echo "================ GLOBAL (by language) ================"
+    echo " 1) All languages (full global index)"
+    echo " 2) English"
+    echo " 3) Spanish"
+    echo " 4) French"
+    echo " 5) German"
+    echo " 6) Italian"
+    echo " 7) Portuguese"
+    echo " 8) Russian"
+    echo " 9) Arabic"
+    echo "10) Chinese"
+    echo "11) Japanese"
+    echo "12) Korean"
+    echo "13) Hindi"
+    echo "14) Back"
+    echo "======================================================"
+    read -rp "Choice: " LCH
+
+    local SRC_URL SRC_FILE LANG_LABEL
+
+    case "$LCH" in
+      1)
+        SRC_URL="$GLOBAL_INDEX_URL"
+        SRC_FILE="$GLOBAL_INDEX"
+        LANG_LABEL="All"
+        ;;
+      2)
+        SRC_URL="https://iptv-org.github.io/iptv/languages/eng.m3u"
+        SRC_FILE="$TV_DIR/global-eng.m3u"
+        LANG_LABEL="English"
+        ;;
+      3)
+        SRC_URL="https://iptv-org.github.io/iptv/languages/spa.m3u"
+        SRC_FILE="$TV_DIR/global-spa.m3u"
+        LANG_LABEL="Spanish"
+        ;;
+      4)
+        SRC_URL="https://iptv-org.github.io/iptv/languages/fra.m3u"
+        SRC_FILE="$TV_DIR/global-fra.m3u"
+        LANG_LABEL="French"
+        ;;
+      5)
+        SRC_URL="https://iptv-org.github.io/iptv/languages/deu.m3u"
+        SRC_FILE="$TV_DIR/global-deu.m3u"
+        LANG_LABEL="German"
+        ;;
+      6)
+        SRC_URL="https://iptv-org.github.io/iptv/languages/ita.m3u"
+        SRC_FILE="$TV_DIR/global-ita.m3u"
+        LANG_LABEL="Italian"
+        ;;
+      7)
+        SRC_URL="https://iptv-org.github.io/iptv/languages/por.m3u"
+        SRC_FILE="$TV_DIR/global-por.m3u"
+        LANG_LABEL="Portuguese"
+        ;;
+      8)
+        SRC_URL="https://iptv-org.github.io/iptv/languages/rus.m3u"
+        SRC_FILE="$TV_DIR/global-rus.m3u"
+        LANG_LABEL="Russian"
+        ;;
+      9)
+        SRC_URL="https://iptv-org.github.io/iptv/languages/ara.m3u"
+        SRC_FILE="$TV_DIR/global-ara.m3u"
+        LANG_LABEL="Arabic"
+        ;;
+      10)
+        SRC_URL="https://iptv-org.github.io/iptv/languages/zho.m3u"
+        SRC_FILE="$TV_DIR/global-zho.m3u"
+        LANG_LABEL="Chinese"
+        ;;
+      11)
+        SRC_URL="https://iptv-org.github.io/iptv/languages/jpn.m3u"
+        SRC_FILE="$TV_DIR/global-jpn.m3u"
+        LANG_LABEL="Japanese"
+        ;;
+      12)
+        SRC_URL="https://iptv-org.github.io/iptv/languages/kor.m3u"
+        SRC_FILE="$TV_DIR/global-kor.m3u"
+        LANG_LABEL="Korean"
+        ;;
+      13)
+        SRC_URL="https://iptv-org.github.io/iptv/languages/hin.m3u"
+        SRC_FILE="$TV_DIR/global-hin.m3u"
+        LANG_LABEL="Hindi"
+        ;;
+      14|"")
+        return
+        ;;
+      *)
+        echo "Invalid choice"; sleep 1; continue
+        ;;
+    esac
+
+    echo ">>> Loading ${LANG_LABEL} playlist..."
+    if ! curl -L "$SRC_URL" -o "$SRC_FILE"; then
+      echo "❌ Failed to load ${LANG_LABEL} playlist."
+      read -rp "Press ENTER to return..." _
+      return
+    fi
+
+    local TMP
+    TMP="$(mktemp)"
+    build_tmp_from_playlist "$SRC_FILE" "$TMP"
+
+    if [ ! -s "$TMP" ]; then
+      echo "❌ No channels in ${LANG_LABEL} playlist."
+      rm -f "$TMP"
+      read -rp "Press ENTER to return..." _
+      continue
+    fi
+
+    tv_menu_from_tmp "$TMP" "GLOBAL / ${LANG_LABEL}"
+    rm -f "$TMP"
+  done
+}
+
+tv_search() {
+  ensure_playlist "$GLOBAL_INDEX" "$GLOBAL_INDEX_URL" "global index (10k+)"
+  command -v mpv >/dev/null || { echo "❌ mpv not installed"; read -rp "Press ENTER..." _; return; }
+
+  local TMP
+  TMP="$(mktemp)"
+  build_tmp_from_playlist "$GLOBAL_INDEX" "$TMP"
+
+  clear
+  echo "================ SEARCH (GLOBAL) ================="
+  echo "Searches channel names in global index."
+  echo "=================================================="
+  read -rp "Search term: " Q
+  if [ -z "$Q" ]; then
+    rm -f "$TMP"
+    return
+  fi
+
+  local S_TMP
+  S_TMP="$(mktemp)"
+
+  while IFS=$'\t' read -r name url; do
+    if printf '%s\n' "$name" | grep -iF -- "$Q" >/dev/null 2>&1; then
+      printf '%s\t%s\n' "$name" "$url" >> "$S_TMP"
+    fi
+  done < "$TMP"
+
+  if [ ! -s "$S_TMP" ]; then
+    echo "❌ No channels matched '$Q'."
+    rm -f "$TMP" "$S_TMP"
+    read -rp "Press ENTER to return..." _
+    return
+  fi
+
+  tv_menu_from_tmp "$S_TMP" "SEARCH: $Q"
+
+  rm -f "$TMP" "$S_TMP"
+}
+
+tv_top_menu() {
+  while true; do
+    clear
+    echo "==================== TV v2.5 ===================="
+    echo " 1) Main list (US / primary)"
+    echo " 2) Global (by language)"
+    echo " 3) Search (global by name)"
+    echo " 4) Update playlists"
+    echo " 5) Exit"
+    echo "================================================="
+    read -rp "Choice: " CH
+
+    case "$CH" in
+      1) tv_main ;;
+      2) tv_global_language ;;
+      3) tv_search ;;
+      4) update_playlists ;;
+      ""|5) break ;;
+      *) echo "Invalid"; sleep 1 ;;
+    esac
+  done
+}
+
+case "$1" in
+  update) update_playlists ;;
+  main)   tv_main ;;
+  global) tv_global_language ;;
+  search) tv_search ;;
+  ""|menu|list) tv_top_menu ;;
+  *) tv_top_menu ;;
+esac
+EOF
+
+chmod +x "$HOME/.local/bin/tv"
