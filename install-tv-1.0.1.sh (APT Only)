@@ -5,6 +5,7 @@
 # - Downloads tvpass playlist to ~/TV/playlist.m3u
 # - Installs "tv" command in ~/.local/bin
 # - Adds a "TV" menu icon (tv.desktop)
+# - CHANGES: Adds channel surfing in mpv: Ctrl+Up / Ctrl+Down
 
 set -e
 
@@ -38,9 +39,15 @@ cat > "$BIN_DIR/tv" << 'EOF'
 # Usage:
 #   tv        -> list channels & pick number to play
 #   tv update -> refresh playlist from tvpass.org
+#
+# Extras:
+#   While a channel is playing in mpv:
+#     Ctrl+Up   -> next channel (surf up)
+#     Ctrl+Down -> previous channel (surf down)
 
 PLAYLIST="$HOME/TV/playlist.m3u"
 TVPASS_URL="https://tvpass.org/playlist/m3u"
+TV_INPUT_CONF="$HOME/TV/tv-input.conf"
 
 ensure_playlist() {
   if [ ! -f "$PLAYLIST" ]; then
@@ -58,8 +65,75 @@ update_playlist() {
   exit 0
 }
 
+ensure_input_conf() {
+  # Create a dedicated input.conf for tv if it doesn't exist.
+  # This avoids messing with the user's global mpv config.
+  if [ ! -f "$TV_INPUT_CONF" ]; then
+    cat > "$TV_INPUT_CONF" << 'EOT'
+# TV surfing bindings for mpv
+# These only apply when launched via the "tv" command.
+
+ctrl+UP no-osd quit 3
+ctrl+DOWN no-osd quit 4
+EOT
+  fi
+}
+
+play_channel() {
+  local CUR="$1"
+  local TMP="$2"
+
+  # Get highest channel index
+  local LAST
+  LAST="$(awk -F'\t' 'END{print $1}' "$TMP")"
+  [ -z "$LAST" ] && return 1
+
+  while true; do
+    local URL NAME
+    URL="$(awk -F'\t' -v i="$CUR" '$1==i{print $3}' "$TMP")"
+    NAME="$(awk -F'\t' -v i="$CUR" '$1==i{print $2}' "$TMP")"
+
+    if [ -z "$URL" ]; then
+      echo "Invalid channel #"
+      sleep 1
+      return 1
+    fi
+
+    echo
+    echo "▶ Playing CH $CUR: $NAME"
+    echo
+    echo "  (In mpv: Ctrl+Up = next channel, Ctrl+Down = previous channel)"
+    echo
+
+    # Fullscreen mpv, using our custom input.conf for surfing
+    mpv --fullscreen \
+        --title="CH $CUR - $NAME" \
+        --input-conf="$TV_INPUT_CONF" \
+        "$URL"
+    code=$?
+
+    case "$code" in
+      3)  # Ctrl+Up -> next channel
+        CUR=$((CUR + 1))
+        [ "$CUR" -gt "$LAST" ] && CUR=1
+        ;;
+      4)  # Ctrl+Down -> previous channel
+        CUR=$((CUR - 1))
+        [ "$CUR" -lt 1 ] && CUR="$LAST"
+        ;;
+      *)
+        # Any other exit (q/ESC/close window) -> back to menu
+        break
+        ;;
+    esac
+  done
+
+  return 0
+}
+
 tv_menu() {
   ensure_playlist
+  ensure_input_conf
 
   command -v mpv >/dev/null || { echo "❌ mpv not installed"; exit 1; }
 
@@ -83,8 +157,9 @@ tv_menu() {
   while true; do
     clear
     echo "==================== TV CHANNELS ===================="
-    echo " Type a number → channel plays in MPV"
+    echo " Type a number → channel plays in MPV (fullscreen)"
     echo " After it closes → list appears again"
+    echo " In mpv: Ctrl+Up / Ctrl+Down → surf channels"
     echo ' Press ENTER with no input to exit'
     echo "====================================================="
     echo
@@ -96,21 +171,8 @@ tv_menu() {
     [ -z "$CH" ] && break
     printf '%s\n' "$CH" | grep -Eq '^[0-9]+$' || { echo "Numbers only"; sleep 1; continue; }
 
-    URL="$(awk -F'\t' -v i="$CH" '$1==i{print $3}' "$TMP")"
-    NAME="$(awk -F'\t' -v i="$CH" '$1==i{print $2}' "$TMP")"
-
-    if [ -z "$URL" ]; then
-      echo "Invalid channel #"
-      sleep 1
-      continue
-    fi
-
-    echo
-    echo "▶ Playing CH $CH: $NAME"
-    echo
-
-    mpv --title="CH $CH - $NAME" "$URL"
-    # when mpv exits, loop continues
+    # Play selected channel, with surfing logic
+    play_channel "$CH" "$TMP"
   done
 
   rm -f "$TMP"
@@ -161,6 +223,11 @@ echo "  • Run 'tv' in a new terminal to open the channel list"
 echo "  • Find 'TV' in your app menu and pin it to favorites/desktop"
 echo
 echo "Commands:"
-echo "  tv         → channel list, type number, plays via mpv"
+echo "  tv         → channel list, type number, plays via mpv (fullscreen)"
 echo "  tv update  → refresh playlist from tvpass.org"
+echo
+echo "While watching in mpv:"
+echo "  Ctrl+Up    → next channel (surf up)"
+echo "  Ctrl+Down  → previous channel (surf down)"
+echo "  q / ESC    → exit back to channel list"
 echo "==============================================="
