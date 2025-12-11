@@ -1,68 +1,13 @@
+cat > "$HOME/.local/bin/tv" << 'EOF'
 #!/usr/bin/env bash
-#
-# TV 3.0 Installer — MPV fullscreen TV with EPG, surfing, DVR, guide, hourly updates
-# Builds on Jonathan's TV 2.x base version.
-#
-# Features:
-# - TVpass playlist + EPG auto-download
-# - NOW / NEXT / +2 upcoming show info (from tvpass EPG)
-# - Ctrl+Up / Ctrl+Down channel surfing (with live updated info panel)
-# - Guide mode ("G"): scrollable 4–6 hour per-channel text guide
-# - Instant DVR: Ctrl+R+C records current channel
-# - Scheduled DVR: "28,11AMTO12PM" syntax
-# - Hourly background updater (systemd user service)
-# - Terminal font size = 20 default (does NOT force fullscreen terminal)
-# - MPV always opens fullscreen
-#
-# This installer is ONE PASTE. Full stop.
-
-
-set -e
-
-echo ">>> Checking for apt..."
-if ! command -v apt >/dev/null 2>&1; then
-  echo "This installer requires Ubuntu/Mint (apt-based)."
-  exit 1
-fi
-
-echo ">>> Installing required packages..."
-sudo apt update
-sudo apt install -y mpv curl xmlstarlet ffmpeg dconf-cli
-
-TV_DIR="$HOME/TV"
-BIN_DIR="$HOME/.local/bin"
-APP_DIR="$HOME/.local/share/applications"
-PLAYLIST="$TV_DIR/playlist.m3u"
-EPG="$TV_DIR/epg.xml"
-TVPASS_PLS="https://tvpass.org/playlist/m3u"
-TVPASS_EPG="https://tvpass.org/epg.xml"
-
-mkdir -p "$TV_DIR" "$BIN_DIR" "$APP_DIR" "$TV_DIR/recordings"
-
-##############################################
-### FORCE TERMINAL FONT SIZE = 20 (Global) ###
-##############################################
-# Only sets font size — does NOT fullscreen terminal.
-# Works for GNOME Terminal (Linux Mint Cinnamon default).
-
-if command -v gsettings >/dev/null; then
-  profile=$(gsettings get org.gnome.Terminal.ProfilesList default | tr -d "'")
-  if [ -n "$profile" ]; then
-    echo ">>> Setting terminal font size = 20..."
-    gsettings set "org.gnome.Terminal.Legacy.Profile:/org/gnome/terminal/legacy/profiles:/:$profile/" use-system-font false || true
-    gsettings set "org.gnome.Terminal.Legacy.Profile:/org/gnome/terminal/legacy/profiles:/:$profile/" font 'Monospace 20' || true
-  fi
-fi
-
-
-##########################################
-### WRITE MAIN TV COMMAND (tv) SCRIPT  ###
-##########################################
-
-cat > "$BIN_DIR/tv" << 'EOF'
-#!/usr/bin/env bash
-# TV 3.0 Runtime
-# Surf TV channels, show EPG info, DVR record, guide mode, auto-updates.
+# TV 3.8 Runtime
+# - Guide only shows channels with EPG, as NOW / NEXT / AFTER / LATER
+# - Main screen shows current title under each channel (1 line)
+# - Tuning + surfing show NOW / NEXT / AFTER / LATER (NOW in red)
+# - Uses system local time to decide what's NOW
+# - Ctrl+Alt+R recording toggle with messages
+# - Channels >=178 removed (sports block)
+# - 'h' = help, 'recordings' opens DVR folder in file manager
 
 PLAYLIST="$HOME/TV/playlist.m3u"
 EPG="$HOME/TV/epg.xml"
@@ -70,6 +15,10 @@ TVPASS_PLS="https://tvpass.org/playlist/m3u"
 TVPASS_EPG="https://tvpass.org/epg.xml"
 INPUT_CONF="$HOME/TV/tv-input.conf"
 RECDIR="$HOME/TV/recordings"
+REC_PIDFILE="$HOME/TV/recording.pid"
+GUIDE_CACHE="$HOME/TV/guide-cache.txt"
+NOW_CACHE="$HOME/TV/now-cache.txt"
+EPG4_CACHE="$HOME/TV/epg-four.txt"
 
 mkdir -p "$RECDIR"
 
@@ -81,7 +30,7 @@ ensure_input_conf() {
     cat > "$INPUT_CONF" << 'EOT'
 ctrl+UP no-osd quit 3
 ctrl+DOWN no-osd quit 4
-ctrl+r+c no-osd quit 5
+ctrl+alt+r no-osd quit 5
 EOT
   fi
 }
@@ -90,11 +39,17 @@ EOT
 ### PLAYLIST + EPG ENSURE / UPDATE
 #########################################
 ensure_playlist() {
-  [ -f "$PLAYLIST" ] || curl -L "$TVPASS_PLS" -o "$PLAYLIST"
+  if [ ! -f "$PLAYLIST" ] || [ ! -s "$PLAYLIST" ]; then
+    echo ">>> Downloading playlist..."
+    curl -L "$TVPASS_PLS" -o "$PLAYLIST"
+  fi
 }
 
 ensure_epg() {
-  [ -f "$EPG" ] || curl -L "$TVPASS_EPG" -o "$EPG"
+  if [ ! -f "$EPG" ] || [ ! -s "$EPG" ]; then
+    echo ">>> Downloading EPG..."
+    curl -L "$TVPASS_EPG" -o "$EPG"
+  fi
 }
 
 update_all() {
@@ -107,8 +62,10 @@ update_all() {
 
 #########################################
 ### PARSE PLAYLIST INTO TEMP TABLE
+### (Drop channels 178+)
 #########################################
 build_table() {
+  local TMP
   TMP=$(mktemp)
   awk -v OFS='\t' '
     BEGIN{n=0; name=""}
@@ -116,6 +73,7 @@ build_table() {
       sub(/.*,/, "", $0); name=$0; next
     }
     /^http/{
+      if (n >= 177) next;   # drop everything from 178 onward
       n++; print n, (name==""?"Unknown":name), $0; name=""
     }
   ' "$PLAYLIST" > "$TMP"
@@ -123,60 +81,210 @@ build_table() {
 }
 
 #########################################
-### EPG QUERY FUNCTIONS
+### BUILD GUIDE / NOW / FOUR-CACHE VIA PYTHON
+### Uses local time; NOW = first programme with stop > now
 #########################################
-get_epg_block() {
-  local id="$1"
-  xmlstarlet sel -t -m "/tv/channel[@id='$id']" -v "@id" -n "$EPG"
+build_guide_cache() {
+  local TABLE="$1"
+  : > "$GUIDE_CACHE"
+  : > "$NOW_CACHE"
+  : > "$EPG4_CACHE"
+
+  python3 - "$EPG" "$TABLE" "$GUIDE_CACHE" "$NOW_CACHE" "$EPG4_CACHE" << 'PY'
+import sys, re
+from datetime import datetime
+import xml.etree.ElementTree as ET
+
+epg_path, table_path, guide_path, now_path, four_path = sys.argv[1:]
+
+# Load EPG
+tree = ET.parse(epg_path)
+root = tree.getroot()
+
+# Index channels
+channels = []
+for ch in root.findall("channel"):
+    cid = ch.get("id", "")
+    names = [dn.text.strip() for dn in ch.findall("display-name") if dn.text]
+    channels.append((cid, names))
+
+def canon_name(s: str) -> str:
+    s = s or ""
+    # Remove common suffixes used in playlist names
+    for token in ["HD", "East", "West", "US", "Feed"]:
+        s = re.sub(r"\b" + re.escape(token) + r"\b", "", s, flags=re.I)
+    s = re.sub(r"\s+", " ", s).strip().lower()
+    return s
+
+def find_channel_id(playlist_name: str):
+    name = (playlist_name or "").strip()
+    if not name:
+        return None
+    # Exact
+    for cid, names in channels:
+      for dn in names:
+        if dn == name:
+            return cid
+    # Fuzzy
+    short = canon_name(name)
+    if not short:
+        return None
+    for cid, names in channels:
+        joined = " ".join(n for n in names if n).lower()
+        if short and short in joined:
+            return cid
+    return None
+
+# Index programmes by channel id
+progs_by_id = {}
+for p in root.findall("programme"):
+    cid = p.get("channel")
+    if not cid:
+        continue
+    progs_by_id.setdefault(cid, []).append(p)
+
+def parse_dt(s: str):
+    if not s:
+        return None
+    for fmt in ("%Y%m%d%H%M%S %z", "%Y%m%d%H%M%S%z"):
+        try:
+            return datetime.strptime(s, fmt).astimezone()
+        except Exception:
+            continue
+    return None
+
+now = datetime.now().astimezone()
+
+def titles_from_now(cid: str):
+    progs = progs_by_id.get(cid, [])
+    if not progs:
+        return []
+    out = []
+    for p in progs:
+        start = parse_dt(p.get("start"))
+        stop = parse_dt(p.get("stop"))
+        if not stop or not start:
+            continue
+        # anything that hasn't finished yet
+        if stop > now:
+            title_el = p.find("title")
+            title = title_el.text.strip() if (title_el is not None and title_el.text) else ""
+            if title:
+                out.append(title)
+        if len(out) >= 4:
+            break
+    return out
+
+# Read playlist table and build caches
+with open(table_path, "r", encoding="utf-8") as tf, \
+     open(guide_path, "w", encoding="utf-8") as gf, \
+     open(now_path, "w", encoding="utf-8") as nf, \
+     open(four_path, "w", encoding="utf-8") as ff:
+
+    for line in tf:
+        parts = line.rstrip("\n").split("\t")
+        if len(parts) < 3:
+            continue
+        num, name, url = parts[0], parts[1], parts[2]
+        if not num:
+            continue
+
+        cid = find_channel_id(name)
+        if not cid:
+            continue
+
+        titles = titles_from_now(cid)
+        if not titles:
+            continue
+
+        # NOW cache (for green text on main list)
+        nf.write(f"{num}\t{name}\t{titles[0]}\n")
+
+        # 4-pack cache for surfing / info pane
+        four = titles + [""] * (4 - len(titles))
+        ff.write(f"{num}\t" + "\t".join(four[:4]) + "\n")
+
+        # Guide block
+        gf.write(f"\x1b[96m{num}. {name}\x1b[0m\n")
+        labels = ["NOW", "NEXT", "AFTER", "LATER"]
+        for i, t in enumerate(titles[:4]):
+            if i == 0:
+                gf.write(f"   \x1b[91m{labels[i]}: {t}\x1b[0m\n")
+            else:
+                gf.write(f"   {labels[i]}: {t}\n")
+        gf.write("\n")
+PY
 }
 
-### Resolve EPG ID from channel name (Simple: exact match or fuzzy)
-resolve_epg_id() {
-  local name="$1"
-  local id
-
-  # Exact match in <channel display-name>
-  id=$(xmlstarlet sel -t \
-       -m "/tv/channel[display-name='$name']" \
-       -v "@id" -n "$EPG" 2>/dev/null)
-
-  [ -n "$id" ] && { echo "$id"; return; }
-
-  # Fuzzy match: strip "East/West/US/HD"
-  local short
-  short=$(echo "$name" | sed 's/HD//;s/East//;s/West//;s/US//;s/Feed//;s/  */ /g')
-
-  id=$(xmlstarlet sel -t \
-       -m "/tv/channel[contains(translate(display-name,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), \
-                                 translate('$short','ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'))]" \
-       -v "@id" -n "$EPG" 2>/dev/null)
-
-  echo "$id"
-}
-
-### Extract NEXT 4 SHOWS (NOW + Next 3)
-epg_now_next() {
-  local id="$1"
-  local now=$(date -u +"%Y%m%d%H%M%S +0000")
-
-  xmlstarlet sel -t \
-    -m "/tv/programme[@channel='$id'][@start <= '$now'][@stop > '$now']" \
-      -v "concat('NOW:', substring(title,1,12))" -n \
-    -m "/tv/programme[@channel='$id'][@start > '$now']" \
-      -v "concat(substring(@start,10,2),':',substring(@start,12,2),' ', substring(title,1,12))" -n \
-    -n "$EPG" 2>/dev/null | head -n 4
+#########################################
+### LOOK UP NOW-TITLE BY CHANNEL NUMBER
+#########################################
+now_title_for_num() {
+  local num="$1"
+  [ -f "$NOW_CACHE" ] || return
+  awk -F'\t' -v n="$num" '$1==n{print $3; exit}' "$NOW_CACHE" 2>/dev/null
 }
 
 #########################################
-### DVR — INSTANT RECORDING
+### SURF INFO BLOCK: NOW / NEXT / AFTER / LATER
 #########################################
-instant_dvr() {
+epg_now_next_block() {
+  local num="$1"
+  [ -f "$EPG4_CACHE" ] || return
+  local line
+  line=$(awk -F'\t' -v n="$num" '$1==n{print; exit}' "$EPG4_CACHE" 2>/dev/null)
+  [ -z "$line" ] && return
+
+  IFS=$'\t' read -r _ NOW NEXT AFTER LATER <<< "$line"
+
+  if [ -n "$NOW" ]; then
+    echo -e "   \e[91mNOW: $NOW\e[0m"
+  fi
+  [ -n "$NEXT" ]  && echo "   NEXT:  $NEXT"
+  [ -n "$AFTER" ] && echo "   AFTER: $AFTER"
+  [ -n "$LATER" ] && echo "   LATER: $LATER"
+}
+
+#########################################
+### DVR — TOGGLE RECORDING
+#########################################
+recording_active() {
+  [ -f "$REC_PIDFILE" ] || return 1
+  local pid
+  pid=$(cat "$REC_PIDFILE" 2>/dev/null || echo "")
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+start_recording() {
   local url="$1"
   local name="$2"
+  local ts outfile
   ts=$(date +"%Y%m%d-%H%M")
   outfile="$RECDIR/${name// /_}-$ts.ts"
-  echo "Recording → $outfile"
-  ffmpeg -i "$url" -c copy "$outfile"
+  echo ">>> Recording started → $outfile"
+  ffmpeg -nostdin -y -i "$url" -c copy "$outfile" >/dev/null 2>&1 &
+  echo $! > "$REC_PIDFILE"
+}
+
+stop_recording() {
+  local pid
+  pid=$(cat "$REC_PIDFILE" 2>/dev/null || echo "")
+  if [ -n "$pid" ]; then
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+  fi
+  rm -f "$REC_PIDFILE"
+  echo ">>> Recording stopped."
+}
+
+toggle_recording() {
+  local url="$1"
+  local name="$2"
+  if recording_active; then
+    stop_recording
+  else
+    start_recording "$url" "$name"
+  fi
 }
 
 #########################################
@@ -184,77 +292,131 @@ instant_dvr() {
 #########################################
 play_channel() {
   local CUR="$1"
-  local TMP="$2"
-  local LAST=$(awk -F'\t' 'END{print $1}' "$TMP")
+  local TABLE="$2"
+  local LAST
+  LAST=$(awk -F'\t' 'END{print $1}' "$TABLE")
 
   while true; do
     local NAME URL
-    NAME=$(awk -F'\t' -v i="$CUR" '$1==i{print $2}' "$TMP")
-    URL=$(awk -F'\t' -v i="$CUR" '$1==i{print $3}' "$TMP")
+    NAME=$(awk -F'\t' -v i="$CUR" '$1==i{print $2}' "$TABLE")
+    URL=$(awk -F'\t' -v i="$CUR" '$1==i{print $3}' "$TABLE")
 
     clear
     echo -e "\e[96m▶ CHANNEL $CUR: $NAME\e[0m"
+    echo
+    epg_now_next_block "$CUR"
+    echo
 
-    # EPG lookup
-    local id
-    id=$(resolve_epg_id "$NAME")
-    if [ -n "$id" ]; then
+    if recording_active; then
+      echo -e "   \e[91m● RECORDING ACTIVE (Ctrl+Alt+R to stop)\e[0m"
       echo
-      epg_now_next "$id" | sed 's/^/   /'
-      echo
-    else
-      echo "   (No EPG data)"
     fi
 
-    echo
-    echo "   Ctrl+Up/Down: Surf | Ctrl+R+C: Record | q: Exit"
+    echo "   Ctrl+Up / Ctrl+Down → Surf channels"
+    echo "   Ctrl+Alt+R          → Toggle recording"
+    echo "   q / ESC             → Exit to channel list"
     echo
 
     mpv --fullscreen --input-conf="$INPUT_CONF" "$URL"
-    code=$?
+    local code=$?
 
     case "$code" in
-      3) CUR=$((CUR+1)); [ "$CUR" -gt "$LAST" ] && CUR=1 ;;
-      4) CUR=$((CUR-1)); [ "$CUR" -lt 1 ] && CUR="$LAST" ;;
-      5) instant_dvr "$URL" "$NAME" ;;
-      *) break ;;
+      3)
+        CUR=$((CUR+1))
+        [ "$CUR" -gt "$LAST" ] && CUR=1
+        ;;
+      4)
+        CUR=$((CUR-1))
+        [ "$CUR" -lt 1 ] && CUR="$LAST"
+        ;;
+      5)
+        toggle_recording "$URL" "$NAME"
+        ;;
+      *)
+        break
+        ;;
     esac
   done
 }
 
 #########################################
-### GUIDE MODE ("G")
+### GUIDE MODE ("G") — USE PREBUILT CACHE
 #########################################
 guide_mode() {
   clear
   echo -e "\e[93m==================== TV GUIDE ====================\e[0m"
-  echo " Type G to return. Shows next 4–6 hours per channel."
+  echo " NOW / NEXT / AFTER / LATER per channel."
+  echo " Enter a channel number to tune, or just ENTER to return."
   echo
 
-  TMP=$(mktemp)
-  build_table > /dev/null
+  if [ -f "$GUIDE_CACHE" ]; then
+    cat "$GUIDE_CACHE"
+  else
+    echo "Guide cache not built yet."
+  fi
 
-  while read -r line; do
-    num=$(echo "$line" | cut -f1)
-    name=$(echo "$line" | cut -f2)
+  local choice
+  read -rp "Channel #: " choice
+  if [ -n "$choice" ] && printf '%s\n' "$choice" | grep -Eq '^[0-9]+$'; then
+    play_channel "$choice" "$TABLE"
+  fi
+}
 
-    echo -e "\e[96m$num. $name\e[0m"
+#########################################
+### HELP SCREEN
+#########################################
+help_screen() {
+  clear
+  echo -e "\e[96m============== TV HELP ==============\e[0m"
+  echo
+  echo " Main screen:"
+  echo "   • Enter a number → tune channel"
+  echo "   • G              → open guide"
+  echo "   • h              → this help screen"
+  echo "   • recordings     → open DVR recordings folder"
+  echo "   • ENTER on blank → exit TV"
+  echo
+  echo " While watching:"
+  echo "   • Ctrl+Up / Ctrl+Down → surf channels"
+  echo "   • Ctrl+Alt+R          → toggle recording"
+  echo "   • q / ESC             → back to channel list"
+  echo
+  echo " DVR:"
+  echo "   • Recordings saved in: $RECDIR"
+  echo "   • Use 'recordings' on main screen to open folder in file manager."
+  echo
+  read -rp "Press ENTER to return to channel list..." _
+}
 
-    id=$(resolve_epg_id "$name")
+#########################################
+### OPEN RECORDINGS FOLDER
+#########################################
+open_recordings() {
+  echo ">>> Opening recordings folder: $RECDIR"
+  if command -v xdg-open >/dev/null 2>&1; then
+    xdg-open "$RECDIR" >/dev/null 2>&1 &
+  else
+    echo "xdg-open not found. Open this path manually:"
+    echo "  $RECDIR"
+  fi
+  read -rp "Press ENTER to return to channel list..." _
+}
 
-    if [ -n "$id" ]; then
-      xmlstarlet sel -t \
-        -m "/tv/programme[@channel='$id']" \
-        -v "concat(substring(@start,10,2),':',substring(@start,12,2),' ', substring(title,1,20))" -n \
-        "$EPG" | head -n 8 | sed 's/^/   /'
+#########################################
+### PRINT CHANNEL LIST WITH CURRENT SHOW
+#########################################
+print_channel_list() {
+  local TABLE="$1"
+  while IFS=$'\t' read -r num name url; do
+    [ -z "$num" ] && continue
+    local nowt
+    nowt=$(now_title_for_num "$num")
+    if [ -n "$nowt" ]; then
+      printf "%-4s %s  \e[92m%s\e[0m\n" "$num" "$name" "${nowt:0:40}"
     else
-      echo "   No EPG available"
+      printf "%-4s %s\n" "$num" "$name"
     fi
-
-    echo
-  done < <(awk '{print}' "$PLAYLIST")
-
-  read -rp "Press ENTER to exit guide..."
+  done < "$TABLE"
 }
 
 #########################################
@@ -264,85 +426,54 @@ ensure_input_conf
 ensure_playlist
 ensure_epg
 
+echo ">>> Building channel list and TV guide..."
+TABLE=$(build_table)
+build_guide_cache "$TABLE"
+echo ">>> Guide ready. Launching TV..."
+sleep 1
+
 case "$1" in
   update) update_all ;;
-  guide|G) guide_mode ;;
+  guide|G|g) guide_mode ;;
   *)
-    TMP=$(build_table)
-
     while true; do
       clear
       echo -e "\e[92m==================== TV CHANNELS ====================\e[0m"
-      echo " Enter number to play | G for guide | ENTER to exit"
+      echo " Enter number to play | G = guide | h = help |"
+      echo " Type 'recordings' to open DVR folder | ENTER to exit"
       echo
-
-      awk -F"\t" '{printf "%-4s %s\n", $1, $2}' "$TMP"
-
+      print_channel_list "$TABLE"
       echo
       read -rp "Channel #: " CH
 
       [ -z "$CH" ] && break
-      [[ "$CH" =~ ^[0-9]+$ ]] || continue
 
-      play_channel "$CH" "$TMP"
+      case "$CH" in
+        [Gg])
+          guide_mode
+          continue
+          ;;
+        [Hh])
+          help_screen
+          continue
+          ;;
+        recordings)
+          open_recordings
+          continue
+          ;;
+      esac
+
+      if ! printf '%s\n' "$CH" | grep -Eq '^[0-9]+$'; then
+        continue
+      fi
+
+      play_channel "$CH" "$TABLE"
     done
 
-    rm -f "$TMP"
+    rm -f "$TABLE"
     ;;
 esac
 EOF
 
-chmod +x "$BIN_DIR/tv"
-
-#########################################
-### CREATE DESKTOP ENTRY
-#########################################
-cat > "$APP_DIR/tv.desktop" << 'EOF'
-[Desktop Entry]
-Name=TV
-Comment=Terminal TV launcher
-Exec=x-terminal-emulator -e bash -lc "tv"
-Icon=utilities-terminal
-Terminal=false
-Type=Application
-Categories=AudioVideo;Entertainment;
-EOF
-
-chmod +x "$APP_DIR/tv.desktop"
-
-#########################################
-### HOURLY AUTO-UPDATER (SYSTEMD USER)
-#########################################
-mkdir -p "$HOME/.local/share/systemd/user"
-
-cat > "$HOME/.local/share/systemd/user/tv-update.service" << 'EOF'
-[Unit]
-Description=Update TV playlist + EPG
-
-[Service]
-Type=oneshot
-ExecStart=/usr/bin/bash -lc "tv update"
-EOF
-
-cat > "$HOME/.local/share/systemd/user/tv-update.timer" << 'EOF'
-[Unit]
-Description=Hourly TV updater
-
-[Timer]
-OnCalendar=hourly
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-EOF
-
-systemctl --user daemon-reload
-systemctl --user enable --now tv-update.timer || true
-
-echo
-echo "==============================================="
-echo "✔ TV 3.0 Installed"
-echo "Run: tv"
-echo "Guide: tv G"
-echo "Hourly updates installed."
-echo "==============================================="
+chmod +x "$HOME/.local/bin/tv"
+echo ">>> TV 3.8 patched. Run: tv"
