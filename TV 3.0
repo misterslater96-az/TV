@@ -1,11 +1,11 @@
 cat > "$HOME/.local/bin/tv" << 'EOF'
 #!/usr/bin/env bash
-# TV 3.9 Runtime
+# TV 3.11 Runtime
 # - Guide only shows channels with EPG, as NOW / NEXT / AFTER / LATER
 # - Main screen shows current title under each channel (1 line)
 # - Tuning + surfing show NOW / NEXT / AFTER / LATER (NOW in red)
 # - Uses system local time to decide what's NOW
-# - Ctrl+Alt+R recording toggle with messages (fixed keybinding)
+# - Ctrl+Alt+R recording toggle with messages
 # - Channels >=178 removed (sports block)
 # - 'h' = help, 'recordings' opens DVR folder in file manager
 
@@ -28,9 +28,9 @@ mkdir -p "$RECDIR"
 #####################################
 ensure_input_conf() {
   cat > "$INPUT_CONF" << 'EOT'
-Ctrl+UP no-osd quit 3
-Ctrl+DOWN no-osd quit 4
-Ctrl+Alt+r no-osd quit 5
+ctrl+UP no-osd quit 3
+ctrl+DOWN no-osd quit 4
+ctrl+alt+r no-osd quit 5
 EOT
 }
 
@@ -383,7 +383,7 @@ help_screen() {
 #########################################
 open_recordings() {
   echo ">>> Opening recordings folder: $RECDIR"
-  if command-verified xdg-open >/dev/null 2>&1; then
+  if command -v xdg-open >/dev/null 2>&1; then
     xdg-open "$RECDIR" >/dev/null 2>&1 &
   else
     echo "xdg-open not found. Open this path manually:"
@@ -466,4 +466,4 @@ esac
 EOF
 
 chmod +x "$HOME/.local/bin/tv"
-echo ">>> TV 3.9 patched. Run: tv"
+echo ">>> TV 3.11 patched. Run: tv"
