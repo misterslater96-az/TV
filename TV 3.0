@@ -1,12 +1,13 @@
 cat > "$HOME/.local/bin/tv" << 'EOF'
 #!/usr/bin/env bash
-# TV 3.62 Runtime
+# TV 3.70 Runtime
 # - TVpass curated list + program guide (what's on now / next)
 # - Green "now playing" text on main list
 # - DVR: live toggle + scheduled from daily guide
-# - 'more' → iptv-org global: fullscreen, surfing, Ctrl+Alt+R record
-# - Global lists use paging so 1000+ channels don't scroll forever
+# - 'more' → iptv-org global: fullscreen, surfing, 1/r to record
 # - mpv/ffmpeg spam hidden, curl quiet
+# - Thunar auto-installed (with mpv + curl) on apt systems for Chromebook/Crostini
+# - Chromebook-friendly: 1 or r toggles recording
 
 #########################################
 ### PATHS / GLOBALS
@@ -24,7 +25,7 @@ REC_PIDFILE="$TV_DIR/recording.pid"
 GUIDE_CACHE="$TV_DIR/guide-cache.txt"
 NOW_CACHE="$TV_DIR/now-cache.txt"
 EPG4_CACHE="$TV_DIR/epg-four.txt"
-NAME_NOW_CACHE="$TV_DIR/now-by-name.txt"   # canonical name → "now playing" title (for reuse)
+NAME_NOW_CACHE="$TV_DIR/now-by-name.txt"   # canonical name → "now playing" title
 
 # iptv-org (huge global lists)
 MAIN_PLAYLIST="$TV_DIR/main.m3u"
@@ -65,7 +66,7 @@ ensure_deps() {
 show_disclaimer() {
   clear
   cat << 'EOD'
-📺 TV 3.62 – Welcome!
+📺 TV 3.70 – Welcome!
 
 Basic controls:
   • On the main list:
@@ -78,7 +79,7 @@ Basic controls:
 
   • While a channel is playing:
       - Ctrl+Up / Ctrl+Down           → move to next / previous channel
-      - Ctrl+Alt+R                    → start/stop recording the stream
+      - 1 or r                        → start/stop recording the stream
       - q or ESC                      → go back to the list
 
 Program info:
@@ -100,7 +101,8 @@ ensure_input_conf() {
   cat > "$INPUT_CONF" << 'EOT'
 ctrl+UP no-osd quit 3
 ctrl+DOWN no-osd quit 4
-ctrl+alt+r no-osd quit 5
+1 no-osd quit 5
+r no-osd quit 5
 EOT
 }
 
@@ -131,7 +133,7 @@ tvpass_update_all() {
 
 #########################################
 ### TVPASS: PARSE PLAYLIST INTO TEMP TABLE
-### (Drop channels 178+ so list is short)
+### (Drop channels 178+)
 #########################################
 build_table() {
   local TMP
@@ -142,7 +144,7 @@ build_table() {
       sub(/.*,/, "", $0); name=$0; next
     }
     /^http/{
-      if (n >= 177) next;
+      if (n >= 177) next;   # drop everything from 178 onward
       n++; print n, (name==""?"Unknown":name), $0; name=""
     }
   ' "$PLAYLIST" > "$TMP"
@@ -151,6 +153,7 @@ build_table() {
 
 #########################################
 ### TVPASS: BUILD GUIDE / NOW / FOUR-CACHE VIA PYTHON
+### Also builds name-based map for reuse on global side
 #########################################
 build_guide_cache() {
   local TABLE="$1"
@@ -171,9 +174,13 @@ root = tree.getroot()
 
 def canon_name(s: str) -> str:
     s = s or ""
+    # strip [720p], [Geo-blocked], etc
     s = re.sub(r"\[[^\]]*\]", " ", s)
+    # strip (USA), (HD), etc
     s = re.sub(r"\([^)]*\)", " ", s)
+    # remove punctuation-ish junk
     s = re.sub(r"[-–_|]", " ", s)
+    # kill common filler words
     for token in ["HD", "East", "West", "US", "USA", "Feed",
                   "TV", "Channel", "Network", "Latino"]:
         s = re.sub(r"\b" + re.escape(token) + r"\b", " ", s, flags=re.I)
@@ -190,10 +197,12 @@ def find_channel_id(playlist_name: str):
     name = (playlist_name or "").strip()
     if not name:
         return None
+    # exact match first
     for cid, names in channels:
         for dn in names:
             if dn == name:
                 return cid
+    # fuzzy via canonicalized name
     short = canon_name(name)
     if not short:
         return None
@@ -223,22 +232,23 @@ def parse_dt(s: str):
 now = datetime.now().astimezone()
 
 def blocks_from_now(cid: str):
+    """Return up to 4 (start, stop, title) blocks from 'now' onward."""
     progs = progs_by_id.get(cid, [])
     if not progs:
         return []
     out = []
     for p in progs:
-        start = parse_dt(p.get("start"))
-        stop = parse_dt(p.get("stop"))
-        if not stop or not start:
-            continue
-        if stop > now:
-            t_el = p.find("title")
-            title = t_el.text.strip() if (t_el is not None and t_el.text) else ""
-            if title:
-                out.append((start, stop, title))
-        if len(out) >= 4:
-            break
+      start = parse_dt(p.get("start"))
+      stop = parse_dt(p.get("stop"))
+      if not stop or not start:
+          continue
+      if stop > now:
+          t_el = p.find("title")
+          title = t_el.text.strip() if (t_el is not None and t_el.text) else ""
+          if title:
+              out.append((start, stop, title))
+      if len(out) >= 4:
+          break
     return out
 
 with open(table_path, "r", encoding="utf-8") as tf, \
@@ -267,16 +277,20 @@ with open(table_path, "r", encoding="utf-8") as tf, \
 
         titles = [b[2] for b in blocks]
 
+        # NOW cache for main list
         nf.write(f"{num}\t{name}\t{titles[0]}\n")
 
+        # Name-based cache (canonical) so global lists can reuse it
         key = canon_name(name)
         if key and key not in seen_names:
             nfname.write(f"{key}\t{titles[0]}\n")
             seen_names.add(key)
 
+        # 4-pack titles (for info overlay while watching)
         four_titles = titles + [""] * (4 - len(titles))
         ff.write(f"{num}\t" + "\t".join(four_titles[:4]) + "\n")
 
+        # Human-readable guide
         gf.write(f"\x1b[96m{num}. {name}\x1b[0m\n")
         for start, stop, title in blocks:
             tstr = f"{start.strftime('%-I:%M %p')}-{stop.strftime('%-I:%M %p')}"
@@ -292,6 +306,33 @@ now_title_for_num() {
   local num="$1"
   [ -f "$NOW_CACHE" ] || return
   awk -F'\t' -v n="$num" '$1==n{print $3; exit}' "$NOW_CACHE" 2>/dev/null
+}
+
+canon_name_shell() {
+  local s="$1"
+  s="${s//[/ }"
+  s="${s//]/ }"
+  s="${s//(/ }"
+  s="${s//)/ }"
+  s=$(printf '%s' "$s" | tr 'A-Z' 'a-z')
+  # trim punctuation-ish junk
+  s=$(printf '%s\n' "$s" | sed 's/[-_|]/ /g')
+  # remove common tokens
+  for w in hd east west us usa feed tv channel network latino; do
+    s=$(printf '%s\n' "$s" | sed "s/\b$w\b//g")
+  done
+  s=$(printf '%s\n' "$s" | tr -s ' ')
+  s=$(printf '%s\n' "$s" | sed 's/^ *//;s/ *$//')
+  printf '%s\n' "$s"
+}
+
+now_title_for_name() {
+  local raw="$1"
+  [ -f "$NAME_NOW_CACHE" ] || return
+  local key
+  key=$(canon_name_shell "$raw")
+  [ -z "$key" ] && return
+  awk -F'\t' -v k="$key" '$1==k{print $2; exit}' "$NAME_NOW_CACHE" 2>/dev/null
 }
 
 #########################################
@@ -366,7 +407,7 @@ stop_recording() {
 toggle_recording() {
   local url="$1"
   local chan="$2"
-  local num="$3"
+  local num="$3"   # TVpass channel number for current show lookup (empty for global)
 
   if recording_active; then
     stop_recording
@@ -453,13 +494,13 @@ play_channel() {
     echo
 
     if recording_active; then
-      echo -e "   \e[91m● RECORDING ACTIVE (Ctrl+Alt+R to stop)\e[0m"
+      echo -e "   \e[91m● RECORDING ACTIVE (1 / r to stop)\e[0m"
       echo
     fi
 
-    echo "   Ctrl+Up / Ctrl+Down → Surf channels"
-    echo "   Ctrl+Alt+R          → Toggle recording"
-    echo "   q / ESC             → Back to list"
+    echo "   Ctrl+Up / Ctrl+Down → Surf channels 🔀"
+    echo "   1 or r              → Toggle recording (live) 🔴"
+    echo "   q / ESC             → Back to list ↩"
     echo
 
     mpv --fullscreen --input-conf="$INPUT_CONF" --quiet --msg-level=all=no "$URL"
@@ -590,7 +631,7 @@ for st,en,title in rows:
 PY
 
   echo
-  echo "Type:  record 6:30pm-7:00pm   to schedule that block"
+  echo "Type:  record 6:30pm-7:00pm   to schedule that block 🎯"
   echo "       ENTER to go back to the channel list."
   echo
 
@@ -632,7 +673,7 @@ PY
 #########################################
 guide_mode() {
   clear
-  echo -e "\e[93m==================== QUICK GUIDE ====================\e[0m"
+  echo -e "\e[93m==================== 🗓️ QUICK GUIDE ====================\e[0m"
   echo " Shows the next few blocks for each channel (local time)."
   echo " Enter a channel number to tune, or just ENTER to return."
   echo
@@ -655,25 +696,28 @@ guide_mode() {
 #########################################
 help_screen() {
   clear
-  echo -e "\e[96m============== TV HELP ==============\e[0m"
+  echo -e "\e[96m============== 📺 TV HELP ==============\e[0m"
   echo
   echo " Main screen (TVpass curated list):"
   echo "   • N               → tune channel N"
   echo "   • G               → quick guide (what's on each channel)"
   echo "   • G N             → full 24h guide for channel N (today)"
-  echo "   • more            → open 10k+ global channels (world list)"
+  echo "   • more            → open 10k+ global channels (world list) 🌍"
   echo "   • h               → this help screen"
   echo "   • recordings      → open DVR recordings folder"
   echo "   • ENTER on blank  → exit TV"
   echo
   echo " While watching any channel:"
-  echo "   • Ctrl+Up / Ctrl+Down → surf channels"
-  echo "   • Ctrl+Alt+R          → toggle live recording"
-  echo "   • q / ESC             → back to channel list"
+  echo "   • Ctrl+Up / Ctrl+Down → surf channels 🔀"
+  echo "   • 1 or r              → toggle live recording 🔴"
+  echo "   • q / ESC             → back to channel list ↩"
   echo
   echo " Global/\"more\" side:"
   echo "   • Same surfing + recording keys"
-  echo "   • Global lists have no real schedule info; TVpass guide only."
+  echo "   • Real schedule info only exists for the curated TVpass list."
+  echo "     The huge global lists normally have no program guide at all."
+  echo "     This script tries to reuse TVpass guide data where names match,"
+  echo "     but most global channels will only show their names."
   echo
   echo " Recordings folder layout:"
   echo "   $RECDIR/<Channel>/<YYYY-MM-DD>/<Channel[_Show]_YYYY-MM-DD_HH-MM-SS>.ts"
@@ -706,24 +750,24 @@ print_channel_list() {
   if [ -f "$NOW_CACHE" ]; then
     awk -F'\t' '
       FNR==NR {
-        now[$1]=$3;
+        now[$1]=$3    # channel number → now-title
         next
       }
       {
-        num=$1; name=$2;
-        if (num == "") next;
+        num=$1; name=$2
+        if (num == "") next
         if (num in now)
-          printf "%-4s %s  \033[92m%.40s\033[0m\n", num, name, now[num];
+          printf "%-4s %s  \033[92m%.40s\033[0m\n", num, name, now[num]
         else
-          printf "%-4s %s\n", num, name;
+          printf "%-4s %s\n", num, name
       }
     ' "$NOW_CACHE" "$TABLE"
   else
     awk -F'\t' '
       {
-        num=$1; name=$2;
-        if (num == "") next;
-        printf "%-4s %s\n", num, name;
+        num=$1; name=$2
+        if (num == "") next
+        printf "%-4s %s\n", num, name
       }
     ' "$TABLE"
   fi
@@ -755,13 +799,13 @@ iptv_build_tmp_from_playlist() {
   awk -v OFS='\t' '
     BEGIN { name="" }
     /^#EXTINF/{
-      name = $0;
-      sub(/.*,/, "", name);
+      name = $0
+      sub(/.*,/, "", name)
       next
     }
     /^https?:\/\//{
-      if (name == "") name = "Unknown";
-      print name, $0;
+      if (name == "") name = "Unknown"
+      print name, $0
       name = ""
     }
   ' "$src" > "$tmp"
@@ -780,15 +824,15 @@ iptv_play_channel() {
 
     clear
     echo -e "\e[96m▶ GLOBAL CHANNEL $CUR: $NAME\e[0m"
-    echo "   (No native program guide for these global lists – channel only)"
+    echo "   (No native program guide for these global lists – channel only) 🌍"
     echo
     if recording_active; then
-      echo -e "   \e[91m● RECORDING ACTIVE (Ctrl+Alt+R to stop)\e[0m"
+      echo -e "   \e[91m● RECORDING ACTIVE (1 / r to stop)\e[0m"
       echo
     fi
-    echo "   Ctrl+Up / Ctrl+Down → Surf channels"
-    echo "   Ctrl+Alt+R          → Toggle recording"
-    echo "   q / ESC             → Back to list"
+    echo "   Ctrl+Up / Ctrl+Down → Surf channels 🔀"
+    echo "   1 or r              → Toggle recording 🔴"
+    echo "   q / ESC             → Back to list ↩"
     echo
 
     mpv --fullscreen --input-conf="$INPUT_CONF" --quiet --msg-level=all=no "$URL"
@@ -813,15 +857,55 @@ iptv_menu_from_tmp() {
     return
   fi
 
-  # Pre-render pretty list (number + name) so drawing is instant
+  # Pre-render pretty list once so drawing is instant
   local PRETTY
   PRETTY="$(mktemp)"
-  cut -f1 "$tmp" | nl -w4 -s'. ' > "$PRETTY"
+
+  if [ -f "$NAME_NOW_CACHE" ]; then
+    awk -F'\t' '
+      function canon(s,    i) {
+        gsub(/\[[^]]*\]/, " ", s)
+        gsub(/\([^)]*\)/, " ", s)
+        gsub(/[-–_|]/, " ", s)
+        s=tolower(s)
+        n=split("hd east west us usa feed tv channel network latino", a, " ")
+        for (i=1; i<=n; i++) {
+          gsub("(^|[[:space:]])" a[i] "([[:space:]]|$)", " ", s)
+        }
+        gsub(/[[:space:]]+/, " ", s)
+        sub(/^[[:space:]]*/, "", s)
+        sub(/[[:space:]]*$/, "", s)
+        return s
+      }
+      FNR==NR {
+        key = canon($1)
+        if (key != "") now[key]=$2
+        next
+      }
+      {
+        name=$1
+        key=canon(name)
+        idx++
+        if (key in now)
+          printf "%4d. %s  \033[92m%.40s\033[0m\n", idx, name, now[key]
+        else
+          printf "%4d. %s\n", idx, name
+      }
+    ' "$NAME_NOW_CACHE" "$tmp" > "$PRETTY"
+  else
+    awk -F'\t' '
+      {
+        name=$1
+        idx++
+        printf "%4d. %s\n", idx, name
+      }
+    ' "$tmp" > "$PRETTY"
+  fi
 
   local TOTAL
   TOTAL=$(wc -l < "$PRETTY")
   if [ "$TOTAL" -le 0 ]; then
-    echo "❌ No displayable channels in $label."
+    echo "❌ No displayable channels in GLOBAL / $label."
     rm -f "$PRETTY"
     read -rp "Press ENTER to return..." _
     return
@@ -843,11 +927,11 @@ iptv_menu_from_tmp() {
     fi
 
     clear
-    echo -e "\e[96m==================== WORLD CHANNELS (${label}) ====================\e[0m"
+    echo -e "\e[96m==================== 🌍 WORLD CHANNELS (${label}) ====================\e[0m"
     echo " Page $PAGE / $MAX_PAGE  |  Channels $START–$END of $TOTAL"
     echo " Type a number → play (global index)."
     echo " n = next page, p = previous page, ENTER = back."
-    echo "=================================================================="
+    echo "======================================================================"
     echo
 
     sed -n "${START},${END}p" "$PRETTY"
@@ -897,7 +981,7 @@ iptv_global_language() {
 
   while true; do
     clear
-    echo -e "\e[96m================ GLOBAL (by language) ================\e[0m"
+    echo -e "\e[96m================ 🌍 GLOBAL (by language) ================\e[0m"
     echo " 1) All languages (full global index)"
     echo " 2) English"
     echo " 3) Spanish"
@@ -912,7 +996,7 @@ iptv_global_language() {
     echo "12) Korean"
     echo "13) Hindi"
     echo "14) Back"
-    echo "====================================================="
+    echo "========================================================="
     read -rp "Choice: " LCH
 
     local SRC_URL SRC_FILE LANG_LABEL
@@ -965,9 +1049,9 @@ iptv_search() {
   iptv_build_tmp_from_playlist "$GLOBAL_INDEX" "$TMP"
 
   clear
-  echo -e "\e[96m================ SEARCH (GLOBAL) =================\e[0m"
+  echo -e "\e[96m================ 🔍 SEARCH (GLOBAL) 🌍 =================\e[0m"
   echo "Searches channel names in the big world list."
-  echo "================================================"
+  echo "========================================================"
   read -rp "Search term: " Q
   if [ -z "$Q" ]; then
     rm -f "$TMP"
@@ -996,12 +1080,12 @@ iptv_search() {
 iptv_top_menu() {
   while true; do
     clear
-    echo -e "\e[96m==================== TV (GLOBAL) ====================\e[0m"
+    echo -e "\e[96m==================== 🌍 TV (GLOBAL) ====================\e[0m"
     echo " 1) Main list (US / iptv-org)"
     echo " 2) Global (by language)"
-    echo " 3) Search (global by name)"
+    echo " 3) Search (global by name) 🔍"
     echo " 4) Back to TVpass main"
-    echo "===================================================="
+    echo "======================================================="
     read -rp "Choice: " CH
 
     case "$CH" in
@@ -1027,7 +1111,7 @@ echo ">>> ⚙️  Building TVpass channel list and guide..."
 TABLE=$(build_table)
 build_guide_cache "$TABLE"
 
-# Pre-warm big global lists so they don't complain later (quiet)
+# Pre-warm big global lists so they don't yell later (quiet)
 iptv_ensure_playlist "$MAIN_PLAYLIST" "$MAIN_URL" "main (US)"      >/dev/null 2>&1
 iptv_ensure_playlist "$GLOBAL_INDEX" "$GLOBAL_INDEX_URL" "global"  >/dev/null 2>&1
 
@@ -1040,9 +1124,9 @@ case "$1" in
   *)
     while true; do
       clear
-      echo -e "\e[92m==================== TV CHANNELS (TVpass) ====================\e[0m"
+      echo -e "\e[92m==================== 📺 TV CHANNELS (TVpass) ====================\e[0m"
       echo " Enter number → play | G = guide | G N = day guide for N | h = help"
-      echo " 'recordings' → open DVR folder | 'more' → world channel list"
+      echo " 'recordings' → open DVR folder | 'more' → world channel list 🌍"
       echo " ENTER on blank line exits TV"
       echo
       print_channel_list "$TABLE"
@@ -1080,4 +1164,4 @@ esac
 EOF
 
 chmod +x "$HOME/.local/bin/tv"
-echo ">>> TV 3.62 installed. Run: tv"
+echo ">>> TV 3.70 installed. Run: tv"
