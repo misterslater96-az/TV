@@ -1,12 +1,14 @@
 cat > "$HOME/.local/bin/tv" << 'EOF'
 #!/usr/bin/env bash
-# TV 3.12 Runtime
-# - Guide only shows channels with EPG, as 4 upcoming time blocks
+# TV 3.20 Runtime
+# - Quick guide (G): 4 upcoming blocks per channel (local time)
+# - Full daily guide (G N): 24h guide for channel N with time blocks
 # - Main screen shows current title under each channel (1 line)
 # - Tuning + surfing show NOW / NEXT / AFTER / LATER (titles only)
-# - Uses system local time to decide what's upcoming
-# - Ctrl+Alt+R recording toggle with messages
-# - Recordings saved under recordings/<Channel>/<YYYY-MM-DD>/Channel[_Show]_YYYY-MM-DD_HH-MM-SS.ts
+# - Uses system local time as anchor
+# - Ctrl+Alt+R recording toggle with messages (live recording)
+# - 'record 6:30pm-7:00pm' from full guide schedules that block
+# - Recordings saved under recordings/<Channel>/<YYYY-MM-DD>/<Channel[_Show]_YYYY-MM-DD_HH-MM-SS>.ts
 # - Channels >=178 removed (sports block)
 # - 'h' = help, 'recordings' opens DVR folder in file manager
 
@@ -192,7 +194,6 @@ with open(table_path, "r", encoding="utf-8") as tf, \
         if not blocks:
             continue
 
-        # titles list for NOW-cache + EPG4-cache
         titles = [b[2] for b in blocks]
 
         # NOW cache for main list
@@ -205,7 +206,6 @@ with open(table_path, "r", encoding="utf-8") as tf, \
         # Human guide: time block in local time + title
         gf.write(f"\x1b[96m{num}. {name}\x1b[0m\n")
         for start, stop, title in blocks:
-            # Local time strings, e.g. 6:30 PM-7:00 PM
             tstr = f"{start.strftime('%-I:%M %p')}-{stop.strftime('%-I:%M %p')}"
             gf.write(f"   {tstr}  {title}\n")
         gf.write("\n")
@@ -242,7 +242,7 @@ epg_now_next_block() {
 }
 
 #########################################
-### DVR — TOGGLE RECORDING
+### DVR — LIVE TOGGLE RECORDING (current show)
 #########################################
 recording_active() {
   [ -f "$REC_PIDFILE" ] || return 1
@@ -256,15 +256,13 @@ start_recording() {
   local chan="$2"
   local show="$3"
 
-  # Clean names for filesystem
-  local chsafe showsafe
+  local chsafe showsafe day ts dir outfile
   chsafe=$(echo "$chan" | tr ' /' '__' | tr -cd 'A-Za-z0-9_.-')
   [ -z "$chsafe" ] && chsafe="Channel"
   if [ -n "$show" ]; then
     showsafe=$(echo "$show" | tr ' /' '__' | tr -cd 'A-Za-z0-9_.-')
   fi
 
-  local day ts dir outfile
   day=$(date +"%Y-%m-%d")
   ts=$(date +"%Y-%m-%d_%H-%M-%S")
   dir="$RECDIR/$chsafe/$day"
@@ -309,6 +307,60 @@ toggle_recording() {
 }
 
 #########################################
+### SCHEDULED RECORDING FOR A TIME BLOCK
+#########################################
+schedule_record_block() {
+  local url="$1"
+  local chan="$2"
+  local show="$3"
+  local start_ts="$4"
+  local end_ts="$5"
+  local label="$6"
+
+  local now_ts duration delay
+  now_ts=$(date +%s)
+  duration=$((end_ts - start_ts))
+  if [ "$duration" -le 0 ]; then
+    echo "Block has zero or negative duration, not scheduling."
+    return
+  fi
+  delay=$((start_ts - now_ts))
+  if [ "$delay" -lt 0 ]; then
+    # already started, record remaining
+    delay=0
+    duration=$((end_ts - now_ts))
+    [ "$duration" -le 0 ] && { echo "Block already finished."; return; }
+  fi
+
+  local chsafe showsafe day ts dir outfile
+  chsafe=$(echo "$chan" | tr ' /' '__' | tr -cd 'A-Za-z0-9_.-')
+  [ -z "$chsafe" ] && chsafe="Channel"
+  if [ -n "$show" ]; then
+    showsafe=$(echo "$show" | tr ' /' '__' | tr -cd 'A-Za-z0-9_.-')
+  fi
+
+  day=$(date -d "@$start_ts" +"%Y-%m-%d")
+  ts=$(date -d "@$start_ts" +"%Y-%m-%d_%H-%M-%S")
+  dir="$RECDIR/$chsafe/$day"
+  mkdir -p "$dir"
+
+  if [ -n "$showsafe" ]; then
+    outfile="$dir/${chsafe}_${showsafe}_$ts.ts"
+  else
+    outfile="$dir/${chsafe}_$ts.ts"
+  fi
+
+  nohup bash -c "
+    sleep $delay;
+    ffmpeg -nostdin -y -i \"$url\" -t $duration -c copy \"$outfile\" >/dev/null 2>&1
+  " >/dev/null 2>&1 &
+
+  echo ">>> Scheduled recording for $chan"
+  echo "    Block: $label – $show"
+  echo "    File:  $outfile"
+}
+
+#########################################
 ### PLAY CHANNEL WITH SURFING
 #########################################
 play_channel() {
@@ -334,7 +386,7 @@ play_channel() {
     fi
 
     echo "   Ctrl+Up / Ctrl+Down → Surf channels"
-    echo "   Ctrl+Alt+R          → Toggle recording"
+    echo "   Ctrl+Alt+R          → Toggle recording (live)"
     echo "   q / ESC             → Exit to channel list"
     echo
 
@@ -358,6 +410,162 @@ play_channel() {
         ;;
     esac
   done
+}
+
+#########################################
+### FULL DAILY GUIDE FOR ONE CHANNEL
+### G N from main menu, then 'record 6:30pm-7:00pm'
+#########################################
+channel_full_guide() {
+  local NUM="$1"
+  local TABLE="$2"
+
+  local NAME URL
+  NAME=$(awk -F'\t' -v i="$NUM" '$1==i{print $2}' "$TABLE")
+  URL=$(awk -F'\t' -v i="$NUM" '$1==i{print $3}' "$TABLE")
+
+  if [ -z "$NAME" ] || [ -z "$URL" ]; then
+    echo "No such channel: $NUM"
+    read -rp "Press ENTER to return..." _
+    return
+  fi
+
+  local MAP
+  MAP=$(mktemp)
+
+  clear
+  echo -e "\e[93m====== DAILY GUIDE: $NUM – $NAME (today, local time) ======\e[0m"
+  echo
+
+  python3 - "$EPG" "$NAME" "$MAP" << 'PY'
+import sys, re
+from datetime import datetime, timedelta
+import xml.etree.ElementTree as ET
+
+epg_path, playlist_name, map_path = sys.argv[1:]
+
+tree = ET.parse(epg_path)
+root = tree.getroot()
+
+def canon_name(s: str) -> str:
+    s = s or ""
+    for token in ["HD", "East", "West", "US", "Feed"]:
+        s = re.sub(r"\b" + re.escape(token) + r"\b", "", s, flags=re.I)
+    s = re.sub(r"\s+", " ", s).strip().lower()
+    return s
+
+def find_channel_id(name):
+    name = (name or "").strip()
+    if not name:
+        return None
+    chans = []
+    for ch in root.findall("channel"):
+        cid = ch.get("id","")
+        names = [dn.text.strip() for dn in ch.findall("display-name") if dn.text]
+        chans.append((cid,names))
+    for cid,names in chans:
+        for dn in names:
+            if dn == name:
+                return cid
+    short = canon_name(name)
+    for cid,names in chans:
+        joined = " ".join(n for n in names if n).lower()
+        if short and short in joined:
+            return cid
+    return None
+
+def parse_dt(s):
+    if not s: return None
+    for fmt in ("%Y%m%d%H%M%S %z","%Y%m%d%H%M%S%z"):
+        try:
+            return datetime.strptime(s,fmt).astimezone()
+        except Exception:
+            continue
+    return None
+
+cid = find_channel_id(playlist_name)
+if not cid:
+    sys.exit(0)
+
+progs = [p for p in root.findall("programme") if p.get("channel")==cid]
+
+now = datetime.now().astimezone()
+start_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
+end_day = start_day + timedelta(days=1)
+
+rows = []
+for p in progs:
+    st = parse_dt(p.get("start"))
+    en = parse_dt(p.get("stop"))
+    if not st or not en:
+        continue
+    if en <= start_day or st >= end_day:
+        continue
+    t_el = p.find("title")
+    title = t_el.text.strip() if (t_el is not None and t_el.text) else ""
+    if not title:
+        continue
+    st_clip = max(st, start_day)
+    en_clip = min(en, end_day)
+    rows.append((st_clip,en_clip,title))
+
+rows.sort(key=lambda r:r[0])
+
+def key_label(dt_start, dt_end):
+    # key: e.g. "6:30pm-7:00pm" (no spaces, lowercase)
+    l1 = dt_start.strftime("%-I:%M%p").lower().replace(" ", "")
+    l2 = dt_end.strftime("%-I:%M%p").lower().replace(" ", "")
+    return f"{l1}-{l2}"
+
+def human_label(dt_start, dt_end):
+    return f"{dt_start.strftime('%-I:%M %p')}-{dt_end.strftime('%-I:%M %p')}"
+
+with open(map_path,"w",encoding="utf-8") as mf:
+    for st,en,title in rows:
+        key = key_label(st,en)
+        label = human_label(st,en)
+        mf.write(f"{key}\t{int(st.timestamp())}\t{int(en.timestamp())}\t{label}\t{title}\n")
+
+for st,en,title in rows:
+    print(f"  {human_label(st,en)}  {title}")
+PY
+
+  echo
+  echo "Type:  record 6:30pm-7:00pm   to schedule that block"
+  echo "       ENTER to go back to the channel list."
+  echo
+
+  while true; do
+    local CMD
+    read -rp "daily-guide> " CMD
+    [ -z "$CMD" ] && break
+
+    case "$CMD" in
+      [Rr]ecord\ *)
+        local ARG KEY
+        ARG=${CMD#*[Rr]ecord }
+        KEY=$(echo "$ARG" | tr -d ' ' | tr 'A-Z' 'a-z')
+        if [ -z "$KEY" ]; then
+          echo "Need a time range like: record 6:30pm-7:00pm"
+          continue
+        fi
+        local INFO
+        INFO=$(awk -F'\t' -v k="$KEY" '$1==k{print;exit}' "$MAP")
+        if [ -z "$INFO" ]; then
+          echo "No matching time block. Use exactly what you see, e.g. 6:30pm-7:00pm"
+          continue
+        fi
+        local ST_TS EN_TS LABEL TITLE
+        IFS=$'\t' read -r _ ST_TS EN_TS LABEL TITLE <<< "$INFO"
+        schedule_record_block "$URL" "$NAME" "$TITLE" "$ST_TS" "$EN_TS" "$LABEL"
+        ;;
+      *)
+        echo "Unknown command. Use: record 6:30pm-7:00pm  or ENTER to leave."
+        ;;
+    esac
+  done
+
+  rm -f "$MAP"
 }
 
 #########################################
@@ -391,16 +599,21 @@ help_screen() {
   echo -e "\e[96m============== TV HELP ==============\e[0m"
   echo
   echo " Main screen:"
-  echo "   • Enter a number → tune channel"
-  echo "   • G              → open quick guide (4 upcoming blocks/channel)"
-  echo "   • h              → this help screen"
-  echo "   • recordings     → open DVR recordings folder"
-  echo "   • ENTER on blank → exit TV"
+  echo "   • N               → tune channel N"
+  echo "   • G               → quick guide (4 upcoming blocks/channel)"
+  echo "   • G N             → full 24h guide for channel N (today)"
+  echo "   • h               → this help screen"
+  echo "   • recordings      → open DVR recordings folder"
+  echo "   • ENTER on blank  → exit TV"
   echo
   echo " While watching:"
   echo "   • Ctrl+Up / Ctrl+Down → surf channels"
-  echo "   • Ctrl+Alt+R          → toggle recording for current channel/show"
+  echo "   • Ctrl+Alt+R          → toggle live recording for current show"
   echo "   • q / ESC             → back to channel list"
+  echo
+  echo " Full daily guide (G N view):"
+  echo "   • Shows blocks as: 6:30 PM-7:00 PM  South Park"
+  echo "   • Type:  record 6:30pm-7:00pm  to schedule that block"
   echo
   echo " Recordings layout:"
   echo "   $RECDIR/<Channel>/<YYYY-MM-DD>/<Channel[_Show]_YYYY-MM-DD_HH-MM-SS>.ts"
@@ -459,7 +672,7 @@ case "$1" in
     while true; do
       clear
       echo -e "\e[92m==================== TV CHANNELS ====================\e[0m"
-      echo " Enter number to play | G = guide | h = help |"
+      echo " Enter number to play | G = guide | G N = daily guide for N | h = help"
       echo " Type 'recordings' to open DVR folder | ENTER to exit"
       echo
       print_channel_list "$TABLE"
@@ -467,6 +680,13 @@ case "$1" in
       read -rp "Channel #: " CH
 
       [ -z "$CH" ] && break
+
+      # G N → full daily guide for channel N
+      if printf '%s\n' "$CH" | grep -Eq '^[Gg][[:space:]]*[0-9]+$'; then
+        NUM=$(printf '%s\n' "$CH" | sed 's/^[Gg][[:space:]]*//')
+        channel_full_guide "$NUM" "$TABLE"
+        continue
+      fi
 
       case "$CH" in
         [Gg])
@@ -496,4 +716,4 @@ esac
 EOF
 
 chmod +x "$HOME/.local/bin/tv"
-echo ">>> TV 3.12 patched. Run: tv"
+echo ">>> TV 3.20 patched. Run: tv"
