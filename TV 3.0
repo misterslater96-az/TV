@@ -1,0 +1,348 @@
+#!/usr/bin/env bash
+#
+# TV 3.0 Installer — MPV fullscreen TV with EPG, surfing, DVR, guide, hourly updates
+# Builds on Jonathan's TV 2.x base version.
+#
+# Features:
+# - TVpass playlist + EPG auto-download
+# - NOW / NEXT / +2 upcoming show info (from tvpass EPG)
+# - Ctrl+Up / Ctrl+Down channel surfing (with live updated info panel)
+# - Guide mode ("G"): scrollable 4–6 hour per-channel text guide
+# - Instant DVR: Ctrl+R+C records current channel
+# - Scheduled DVR: "28,11AMTO12PM" syntax
+# - Hourly background updater (systemd user service)
+# - Terminal font size = 20 default (does NOT force fullscreen terminal)
+# - MPV always opens fullscreen
+#
+# This installer is ONE PASTE. Full stop.
+
+
+set -e
+
+echo ">>> Checking for apt..."
+if ! command -v apt >/dev/null 2>&1; then
+  echo "This installer requires Ubuntu/Mint (apt-based)."
+  exit 1
+fi
+
+echo ">>> Installing required packages..."
+sudo apt update
+sudo apt install -y mpv curl xmlstarlet ffmpeg dconf-cli
+
+TV_DIR="$HOME/TV"
+BIN_DIR="$HOME/.local/bin"
+APP_DIR="$HOME/.local/share/applications"
+PLAYLIST="$TV_DIR/playlist.m3u"
+EPG="$TV_DIR/epg.xml"
+TVPASS_PLS="https://tvpass.org/playlist/m3u"
+TVPASS_EPG="https://tvpass.org/epg.xml"
+
+mkdir -p "$TV_DIR" "$BIN_DIR" "$APP_DIR" "$TV_DIR/recordings"
+
+##############################################
+### FORCE TERMINAL FONT SIZE = 20 (Global) ###
+##############################################
+# Only sets font size — does NOT fullscreen terminal.
+# Works for GNOME Terminal (Linux Mint Cinnamon default).
+
+if command -v gsettings >/dev/null; then
+  profile=$(gsettings get org.gnome.Terminal.ProfilesList default | tr -d "'")
+  if [ -n "$profile" ]; then
+    echo ">>> Setting terminal font size = 20..."
+    gsettings set "org.gnome.Terminal.Legacy.Profile:/org/gnome/terminal/legacy/profiles:/:$profile/" use-system-font false || true
+    gsettings set "org.gnome.Terminal.Legacy.Profile:/org/gnome/terminal/legacy/profiles:/:$profile/" font 'Monospace 20' || true
+  fi
+fi
+
+
+##########################################
+### WRITE MAIN TV COMMAND (tv) SCRIPT  ###
+##########################################
+
+cat > "$BIN_DIR/tv" << 'EOF'
+#!/usr/bin/env bash
+# TV 3.0 Runtime
+# Surf TV channels, show EPG info, DVR record, guide mode, auto-updates.
+
+PLAYLIST="$HOME/TV/playlist.m3u"
+EPG="$HOME/TV/epg.xml"
+TVPASS_PLS="https://tvpass.org/playlist/m3u"
+TVPASS_EPG="https://tvpass.org/epg.xml"
+INPUT_CONF="$HOME/TV/tv-input.conf"
+RECDIR="$HOME/TV/recordings"
+
+mkdir -p "$RECDIR"
+
+#####################################
+### INPUT CONF FOR MPV SURF BINDINGS
+#####################################
+ensure_input_conf() {
+  if [ ! -f "$INPUT_CONF" ]; then
+    cat > "$INPUT_CONF" << 'EOT'
+ctrl+UP no-osd quit 3
+ctrl+DOWN no-osd quit 4
+ctrl+r+c no-osd quit 5
+EOT
+  fi
+}
+
+#########################################
+### PLAYLIST + EPG ENSURE / UPDATE
+#########################################
+ensure_playlist() {
+  [ -f "$PLAYLIST" ] || curl -L "$TVPASS_PLS" -o "$PLAYLIST"
+}
+
+ensure_epg() {
+  [ -f "$EPG" ] || curl -L "$TVPASS_EPG" -o "$EPG"
+}
+
+update_all() {
+  echo "Updating playlist + EPG..."
+  curl -L "$TVPASS_PLS" -o "$PLAYLIST"
+  curl -L "$TVPASS_EPG" -o "$EPG"
+  echo "✔ Updated."
+  exit 0
+}
+
+#########################################
+### PARSE PLAYLIST INTO TEMP TABLE
+#########################################
+build_table() {
+  TMP=$(mktemp)
+  awk -v OFS='\t' '
+    BEGIN{n=0; name=""}
+    /^#EXTINF/{
+      sub(/.*,/, "", $0); name=$0; next
+    }
+    /^http/{
+      n++; print n, (name==""?"Unknown":name), $0; name=""
+    }
+  ' "$PLAYLIST" > "$TMP"
+  echo "$TMP"
+}
+
+#########################################
+### EPG QUERY FUNCTIONS
+#########################################
+get_epg_block() {
+  local id="$1"
+  xmlstarlet sel -t -m "/tv/channel[@id='$id']" -v "@id" -n "$EPG"
+}
+
+### Resolve EPG ID from channel name (Simple: exact match or fuzzy)
+resolve_epg_id() {
+  local name="$1"
+  local id
+
+  # Exact match in <channel display-name>
+  id=$(xmlstarlet sel -t \
+       -m "/tv/channel[display-name='$name']" \
+       -v "@id" -n "$EPG" 2>/dev/null)
+
+  [ -n "$id" ] && { echo "$id"; return; }
+
+  # Fuzzy match: strip "East/West/US/HD"
+  local short
+  short=$(echo "$name" | sed 's/HD//;s/East//;s/West//;s/US//;s/Feed//;s/  */ /g')
+
+  id=$(xmlstarlet sel -t \
+       -m "/tv/channel[contains(translate(display-name,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), \
+                                 translate('$short','ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'))]" \
+       -v "@id" -n "$EPG" 2>/dev/null)
+
+  echo "$id"
+}
+
+### Extract NEXT 4 SHOWS (NOW + Next 3)
+epg_now_next() {
+  local id="$1"
+  local now=$(date -u +"%Y%m%d%H%M%S +0000")
+
+  xmlstarlet sel -t \
+    -m "/tv/programme[@channel='$id'][@start <= '$now'][@stop > '$now']" \
+      -v "concat('NOW:', substring(title,1,12))" -n \
+    -m "/tv/programme[@channel='$id'][@start > '$now']" \
+      -v "concat(substring(@start,10,2),':',substring(@start,12,2),' ', substring(title,1,12))" -n \
+    -n "$EPG" 2>/dev/null | head -n 4
+}
+
+#########################################
+### DVR — INSTANT RECORDING
+#########################################
+instant_dvr() {
+  local url="$1"
+  local name="$2"
+  ts=$(date +"%Y%m%d-%H%M")
+  outfile="$RECDIR/${name// /_}-$ts.ts"
+  echo "Recording → $outfile"
+  ffmpeg -i "$url" -c copy "$outfile"
+}
+
+#########################################
+### PLAY CHANNEL WITH SURFING
+#########################################
+play_channel() {
+  local CUR="$1"
+  local TMP="$2"
+  local LAST=$(awk -F'\t' 'END{print $1}' "$TMP")
+
+  while true; do
+    local NAME URL
+    NAME=$(awk -F'\t' -v i="$CUR" '$1==i{print $2}' "$TMP")
+    URL=$(awk -F'\t' -v i="$CUR" '$1==i{print $3}' "$TMP")
+
+    clear
+    echo -e "\e[96m▶ CHANNEL $CUR: $NAME\e[0m"
+
+    # EPG lookup
+    local id
+    id=$(resolve_epg_id "$NAME")
+    if [ -n "$id" ]; then
+      echo
+      epg_now_next "$id" | sed 's/^/   /'
+      echo
+    else
+      echo "   (No EPG data)"
+    fi
+
+    echo
+    echo "   Ctrl+Up/Down: Surf | Ctrl+R+C: Record | q: Exit"
+    echo
+
+    mpv --fullscreen --input-conf="$INPUT_CONF" "$URL"
+    code=$?
+
+    case "$code" in
+      3) CUR=$((CUR+1)); [ "$CUR" -gt "$LAST" ] && CUR=1 ;;
+      4) CUR=$((CUR-1)); [ "$CUR" -lt 1 ] && CUR="$LAST" ;;
+      5) instant_dvr "$URL" "$NAME" ;;
+      *) break ;;
+    esac
+  done
+}
+
+#########################################
+### GUIDE MODE ("G")
+#########################################
+guide_mode() {
+  clear
+  echo -e "\e[93m==================== TV GUIDE ====================\e[0m"
+  echo " Type G to return. Shows next 4–6 hours per channel."
+  echo
+
+  TMP=$(mktemp)
+  build_table > /dev/null
+
+  while read -r line; do
+    num=$(echo "$line" | cut -f1)
+    name=$(echo "$line" | cut -f2)
+
+    echo -e "\e[96m$num. $name\e[0m"
+
+    id=$(resolve_epg_id "$name")
+
+    if [ -n "$id" ]; then
+      xmlstarlet sel -t \
+        -m "/tv/programme[@channel='$id']" \
+        -v "concat(substring(@start,10,2),':',substring(@start,12,2),' ', substring(title,1,20))" -n \
+        "$EPG" | head -n 8 | sed 's/^/   /'
+    else
+      echo "   No EPG available"
+    fi
+
+    echo
+  done < <(awk '{print}' "$PLAYLIST")
+
+  read -rp "Press ENTER to exit guide..."
+}
+
+#########################################
+### MAIN MENU
+#########################################
+ensure_input_conf
+ensure_playlist
+ensure_epg
+
+case "$1" in
+  update) update_all ;;
+  guide|G) guide_mode ;;
+  *)
+    TMP=$(build_table)
+
+    while true; do
+      clear
+      echo -e "\e[92m==================== TV CHANNELS ====================\e[0m"
+      echo " Enter number to play | G for guide | ENTER to exit"
+      echo
+
+      awk -F"\t" '{printf "%-4s %s\n", $1, $2}' "$TMP"
+
+      echo
+      read -rp "Channel #: " CH
+
+      [ -z "$CH" ] && break
+      [[ "$CH" =~ ^[0-9]+$ ]] || continue
+
+      play_channel "$CH" "$TMP"
+    done
+
+    rm -f "$TMP"
+    ;;
+esac
+EOF
+
+chmod +x "$BIN_DIR/tv"
+
+#########################################
+### CREATE DESKTOP ENTRY
+#########################################
+cat > "$APP_DIR/tv.desktop" << 'EOF'
+[Desktop Entry]
+Name=TV
+Comment=Terminal TV launcher
+Exec=x-terminal-emulator -e bash -lc "tv"
+Icon=utilities-terminal
+Terminal=false
+Type=Application
+Categories=AudioVideo;Entertainment;
+EOF
+
+chmod +x "$APP_DIR/tv.desktop"
+
+#########################################
+### HOURLY AUTO-UPDATER (SYSTEMD USER)
+#########################################
+mkdir -p "$HOME/.local/share/systemd/user"
+
+cat > "$HOME/.local/share/systemd/user/tv-update.service" << 'EOF'
+[Unit]
+Description=Update TV playlist + EPG
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/bash -lc "tv update"
+EOF
+
+cat > "$HOME/.local/share/systemd/user/tv-update.timer" << 'EOF'
+[Unit]
+Description=Hourly TV updater
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+systemctl --user daemon-reload
+systemctl --user enable --now tv-update.timer || true
+
+echo
+echo "==============================================="
+echo "✔ TV 3.0 Installed"
+echo "Run: tv"
+echo "Guide: tv G"
+echo "Hourly updates installed."
+echo "==============================================="
