@@ -1,11 +1,11 @@
 cat > "$HOME/.local/bin/tv" << 'EOF'
 #!/usr/bin/env bash
-# TV 3.8 Runtime
+# TV 3.9 Runtime
 # - Guide only shows channels with EPG, as NOW / NEXT / AFTER / LATER
 # - Main screen shows current title under each channel (1 line)
 # - Tuning + surfing show NOW / NEXT / AFTER / LATER (NOW in red)
 # - Uses system local time to decide what's NOW
-# - Ctrl+Alt+R recording toggle with messages
+# - Ctrl+Alt+R recording toggle with messages (fixed keybinding)
 # - Channels >=178 removed (sports block)
 # - 'h' = help, 'recordings' opens DVR folder in file manager
 
@@ -24,15 +24,14 @@ mkdir -p "$RECDIR"
 
 #####################################
 ### INPUT CONF FOR MPV SURF BINDINGS
+### (always rewrite so bindings stay in sync)
 #####################################
 ensure_input_conf() {
-  if [ ! -f "$INPUT_CONF" ]; then
-    cat > "$INPUT_CONF" << 'EOT'
-ctrl+UP no-osd quit 3
-ctrl+DOWN no-osd quit 4
-ctrl+alt+r no-osd quit 5
+  cat > "$INPUT_CONF" << 'EOT'
+Ctrl+UP no-osd quit 3
+Ctrl+DOWN no-osd quit 4
+Ctrl+Alt+r no-osd quit 5
 EOT
-  fi
 }
 
 #########################################
@@ -97,11 +96,9 @@ import xml.etree.ElementTree as ET
 
 epg_path, table_path, guide_path, now_path, four_path = sys.argv[1:]
 
-# Load EPG
 tree = ET.parse(epg_path)
 root = tree.getroot()
 
-# Index channels
 channels = []
 for ch in root.findall("channel"):
     cid = ch.get("id", "")
@@ -110,7 +107,6 @@ for ch in root.findall("channel"):
 
 def canon_name(s: str) -> str:
     s = s or ""
-    # Remove common suffixes used in playlist names
     for token in ["HD", "East", "West", "US", "Feed"]:
         s = re.sub(r"\b" + re.escape(token) + r"\b", "", s, flags=re.I)
     s = re.sub(r"\s+", " ", s).strip().lower()
@@ -120,12 +116,12 @@ def find_channel_id(playlist_name: str):
     name = (playlist_name or "").strip()
     if not name:
         return None
-    # Exact
+    # exact
     for cid, names in channels:
-      for dn in names:
-        if dn == name:
-            return cid
-    # Fuzzy
+        for dn in names:
+            if dn == name:
+                return cid
+    # fuzzy
     short = canon_name(name)
     if not short:
         return None
@@ -135,7 +131,6 @@ def find_channel_id(playlist_name: str):
             return cid
     return None
 
-# Index programmes by channel id
 progs_by_id = {}
 for p in root.findall("programme"):
     cid = p.get("channel")
@@ -165,7 +160,6 @@ def titles_from_now(cid: str):
         stop = parse_dt(p.get("stop"))
         if not stop or not start:
             continue
-        # anything that hasn't finished yet
         if stop > now:
             title_el = p.find("title")
             title = title_el.text.strip() if (title_el is not None and title_el.text) else ""
@@ -175,7 +169,6 @@ def titles_from_now(cid: str):
             break
     return out
 
-# Read playlist table and build caches
 with open(table_path, "r", encoding="utf-8") as tf, \
      open(guide_path, "w", encoding="utf-8") as gf, \
      open(now_path, "w", encoding="utf-8") as nf, \
@@ -197,14 +190,11 @@ with open(table_path, "r", encoding="utf-8") as tf, \
         if not titles:
             continue
 
-        # NOW cache (for green text on main list)
         nf.write(f"{num}\t{name}\t{titles[0]}\n")
 
-        # 4-pack cache for surfing / info pane
         four = titles + [""] * (4 - len(titles))
         ff.write(f"{num}\t" + "\t".join(four[:4]) + "\n")
 
-        # Guide block
         gf.write(f"\x1b[96m{num}. {name}\x1b[0m\n")
         labels = ["NOW", "NEXT", "AFTER", "LATER"]
         for i, t in enumerate(titles[:4]):
@@ -393,7 +383,7 @@ help_screen() {
 #########################################
 open_recordings() {
   echo ">>> Opening recordings folder: $RECDIR"
-  if command -v xdg-open >/dev/null 2>&1; then
+  if command-verified xdg-open >/dev/null 2>&1; then
     xdg-open "$RECDIR" >/dev/null 2>&1 &
   else
     echo "xdg-open not found. Open this path manually:"
@@ -476,4 +466,4 @@ esac
 EOF
 
 chmod +x "$HOME/.local/bin/tv"
-echo ">>> TV 3.8 patched. Run: tv"
+echo ">>> TV 3.9 patched. Run: tv"
