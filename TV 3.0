@@ -1,11 +1,12 @@
 cat > "$HOME/.local/bin/tv" << 'EOF'
 #!/usr/bin/env bash
-# TV 3.11 Runtime
-# - Guide only shows channels with EPG, as NOW / NEXT / AFTER / LATER
+# TV 3.12 Runtime
+# - Guide only shows channels with EPG, as 4 upcoming time blocks
 # - Main screen shows current title under each channel (1 line)
-# - Tuning + surfing show NOW / NEXT / AFTER / LATER (NOW in red)
-# - Uses system local time to decide what's NOW
+# - Tuning + surfing show NOW / NEXT / AFTER / LATER (titles only)
+# - Uses system local time to decide what's upcoming
 # - Ctrl+Alt+R recording toggle with messages
+# - Recordings saved under recordings/<Channel>/<YYYY-MM-DD>/Channel[_Show]_YYYY-MM-DD_HH-MM-SS.ts
 # - Channels >=178 removed (sports block)
 # - 'h' = help, 'recordings' opens DVR folder in file manager
 
@@ -81,7 +82,7 @@ build_table() {
 
 #########################################
 ### BUILD GUIDE / NOW / FOUR-CACHE VIA PYTHON
-### Uses local time; NOW = first programme with stop > now
+### Uses local time; picks first 4 programmes with stop > now
 #########################################
 build_guide_cache() {
   local TABLE="$1"
@@ -150,7 +151,8 @@ def parse_dt(s: str):
 
 now = datetime.now().astimezone()
 
-def titles_from_now(cid: str):
+def blocks_from_now(cid: str):
+    """Return up to 4 (start, stop, title) blocks from 'now' onward."""
     progs = progs_by_id.get(cid, [])
     if not progs:
         return []
@@ -161,10 +163,10 @@ def titles_from_now(cid: str):
         if not stop or not start:
             continue
         if stop > now:
-            title_el = p.find("title")
-            title = title_el.text.strip() if (title_el is not None and title_el.text) else ""
+            t_el = p.find("title")
+            title = t_el.text.strip() if (t_el is not None and t_el.text) else ""
             if title:
-                out.append(title)
+                out.append((start, stop, title))
         if len(out) >= 4:
             break
     return out
@@ -186,22 +188,26 @@ with open(table_path, "r", encoding="utf-8") as tf, \
         if not cid:
             continue
 
-        titles = titles_from_now(cid)
-        if not titles:
+        blocks = blocks_from_now(cid)
+        if not blocks:
             continue
 
+        # titles list for NOW-cache + EPG4-cache
+        titles = [b[2] for b in blocks]
+
+        # NOW cache for main list
         nf.write(f"{num}\t{name}\t{titles[0]}\n")
 
-        four = titles + [""] * (4 - len(titles))
-        ff.write(f"{num}\t" + "\t".join(four[:4]) + "\n")
+        # 4-pack titles (for info overlay while watching)
+        four_titles = titles + [""] * (4 - len(titles))
+        ff.write(f"{num}\t" + "\t".join(four_titles[:4]) + "\n")
 
+        # Human guide: time block in local time + title
         gf.write(f"\x1b[96m{num}. {name}\x1b[0m\n")
-        labels = ["NOW", "NEXT", "AFTER", "LATER"]
-        for i, t in enumerate(titles[:4]):
-            if i == 0:
-                gf.write(f"   \x1b[91m{labels[i]}: {t}\x1b[0m\n")
-            else:
-                gf.write(f"   {labels[i]}: {t}\n")
+        for start, stop, title in blocks:
+            # Local time strings, e.g. 6:30 PM-7:00 PM
+            tstr = f"{start.strftime('%-I:%M %p')}-{stop.strftime('%-I:%M %p')}"
+            gf.write(f"   {tstr}  {title}\n")
         gf.write("\n")
 PY
 }
@@ -216,7 +222,7 @@ now_title_for_num() {
 }
 
 #########################################
-### SURF INFO BLOCK: NOW / NEXT / AFTER / LATER
+### SURF INFO BLOCK: NOW / NEXT / AFTER / LATER (titles)
 #########################################
 epg_now_next_block() {
   local num="$1"
@@ -247,10 +253,29 @@ recording_active() {
 
 start_recording() {
   local url="$1"
-  local name="$2"
-  local ts outfile
-  ts=$(date +"%Y%m%d-%H%M")
-  outfile="$RECDIR/${name// /_}-$ts.ts"
+  local chan="$2"
+  local show="$3"
+
+  # Clean names for filesystem
+  local chsafe showsafe
+  chsafe=$(echo "$chan" | tr ' /' '__' | tr -cd 'A-Za-z0-9_.-')
+  [ -z "$chsafe" ] && chsafe="Channel"
+  if [ -n "$show" ]; then
+    showsafe=$(echo "$show" | tr ' /' '__' | tr -cd 'A-Za-z0-9_.-')
+  fi
+
+  local day ts dir outfile
+  day=$(date +"%Y-%m-%d")
+  ts=$(date +"%Y-%m-%d_%H-%M-%S")
+  dir="$RECDIR/$chsafe/$day"
+  mkdir -p "$dir"
+
+  if [ -n "$showsafe" ]; then
+    outfile="$dir/${chsafe}_${showsafe}_$ts.ts"
+  else
+    outfile="$dir/${chsafe}_$ts.ts"
+  fi
+
   echo ">>> Recording started → $outfile"
   ffmpeg -nostdin -y -i "$url" -c copy "$outfile" >/dev/null 2>&1 &
   echo $! > "$REC_PIDFILE"
@@ -269,11 +294,17 @@ stop_recording() {
 
 toggle_recording() {
   local url="$1"
-  local name="$2"
+  local chan="$2"
+  local num="$3"   # channel number (for current show lookup)
+
   if recording_active; then
     stop_recording
   else
-    start_recording "$url" "$name"
+    local show=""
+    if [ -n "$num" ]; then
+      show=$(now_title_for_num "$num")
+    fi
+    start_recording "$url" "$chan" "$show"
   fi
 }
 
@@ -320,7 +351,7 @@ play_channel() {
         [ "$CUR" -lt 1 ] && CUR="$LAST"
         ;;
       5)
-        toggle_recording "$URL" "$NAME"
+        toggle_recording "$URL" "$NAME" "$CUR"
         ;;
       *)
         break
@@ -335,7 +366,7 @@ play_channel() {
 guide_mode() {
   clear
   echo -e "\e[93m==================== TV GUIDE ====================\e[0m"
-  echo " NOW / NEXT / AFTER / LATER per channel."
+  echo " Next 4 upcoming blocks per channel (local time)."
   echo " Enter a channel number to tune, or just ENTER to return."
   echo
 
@@ -361,19 +392,18 @@ help_screen() {
   echo
   echo " Main screen:"
   echo "   • Enter a number → tune channel"
-  echo "   • G              → open guide"
+  echo "   • G              → open quick guide (4 upcoming blocks/channel)"
   echo "   • h              → this help screen"
   echo "   • recordings     → open DVR recordings folder"
   echo "   • ENTER on blank → exit TV"
   echo
   echo " While watching:"
   echo "   • Ctrl+Up / Ctrl+Down → surf channels"
-  echo "   • Ctrl+Alt+R          → toggle recording"
+  echo "   • Ctrl+Alt+R          → toggle recording for current channel/show"
   echo "   • q / ESC             → back to channel list"
   echo
-  echo " DVR:"
-  echo "   • Recordings saved in: $RECDIR"
-  echo "   • Use 'recordings' on main screen to open folder in file manager."
+  echo " Recordings layout:"
+  echo "   $RECDIR/<Channel>/<YYYY-MM-DD>/<Channel[_Show]_YYYY-MM-DD_HH-MM-SS>.ts"
   echo
   read -rp "Press ENTER to return to channel list..." _
 }
@@ -466,4 +496,4 @@ esac
 EOF
 
 chmod +x "$HOME/.local/bin/tv"
-echo ">>> TV 3.11 patched. Run: tv"
+echo ">>> TV 3.12 patched. Run: tv"
