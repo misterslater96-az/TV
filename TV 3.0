@@ -1,6 +1,6 @@
 cat > "$HOME/.local/bin/tv" << 'EOF'
 #!/usr/bin/env bash
-# TV 3.70 Runtime
+# TV 3.71 Runtime
 # - TVpass curated list + program guide (what's on now / next)
 # - Green "now playing" text on main list
 # - DVR: live toggle + scheduled from daily guide
@@ -8,6 +8,20 @@ cat > "$HOME/.local/bin/tv" << 'EOF'
 # - mpv/ffmpeg spam hidden, curl quiet
 # - Thunar auto-installed (with mpv + curl) on apt systems for Chromebook/Crostini
 # - Chromebook-friendly: 1 or r toggles recording
+# - Best-effort sleep inhibition (Chromebook-safe; falls back cleanly if denied)
+
+#########################################
+### PREVENT SLEEP WHILE TV RUNS (BEST-EFFORT)
+#########################################
+if command -v systemd-inhibit >/dev/null 2>&1 && [ -z "${TV_INHIBIT:-}" ]; then
+  if systemd-inhibit --what=idle:sleep --mode=block --why="TV quick-test" sleep 0.1 >/dev/null 2>&1; then
+    exec systemd-inhibit --what=idle:sleep --mode=block --why="TV running" \
+      env TV_INHIBIT=1 "$0" "$@"
+  else
+    # Permission denied or not supported (e.g. some Chromebooks) → just continue normally
+    export TV_INHIBIT=disabled
+  fi
+fi
 
 #########################################
 ### PATHS / GLOBALS
@@ -66,7 +80,7 @@ ensure_deps() {
 show_disclaimer() {
   clear
   cat << 'EOD'
-📺 TV 3.70 – Welcome!
+📺 TV 3.71 – Welcome!
 
 Basic controls:
   • On the main list:
@@ -238,17 +252,17 @@ def blocks_from_now(cid: str):
         return []
     out = []
     for p in progs:
-      start = parse_dt(p.get("start"))
-      stop = parse_dt(p.get("stop"))
-      if not stop or not start:
-          continue
-      if stop > now:
-          t_el = p.find("title")
-          title = t_el.text.strip() if (t_el is not None and t_el.text) else ""
-          if title:
-              out.append((start, stop, title))
-      if len(out) >= 4:
-          break
+        start = parse_dt(p.get("start"))
+        stop = parse_dt(p.get("stop"))
+        if not stop or not start:
+            continue
+        if stop > now:
+            t_el = p.find("title")
+            title = t_el.text.strip() if (t_el is not None and t_el.text) else ""
+            if title:
+                out.append((start, stop, title))
+        if len(out) >= 4:
+            break
     return out
 
 with open(table_path, "r", encoding="utf-8") as tf, \
@@ -319,7 +333,7 @@ canon_name_shell() {
   s=$(printf '%s\n' "$s" | sed 's/[-_|]/ /g')
   # remove common tokens
   for w in hd east west us usa feed tv channel network latino; do
-    s=$(printf '%s\n' "$s" | sed "s/\b$w\b//g")
+    s=$(printf '%s\n' "$s" | sed "s/ $w / /g")
   done
   s=$(printf '%s\n' "$s" | tr -s ' ')
   s=$(printf '%s\n' "$s" | sed 's/^ *//;s/ *$//')
@@ -916,12 +930,12 @@ iptv_menu_from_tmp() {
     PAGE_SIZE="$TOTAL"
   fi
   local PAGE=1
-  local MAX_PAGE=$(( (TOTAL + PAGE_SIZE - 1) / PAGE_SIZE ))
+  local MAX_PAGE=$(((TOTAL + PAGE_SIZE - 1) / PAGE_SIZE))
 
   while true; do
     local START END
-    START=$(( (PAGE - 1) * PAGE_SIZE + 1 ))
-    END=$(( START + PAGE_SIZE - 1 ))
+    START=$(((PAGE - 1) * PAGE_SIZE + 1))
+    END=$((START + PAGE_SIZE - 1))
     if [ "$END" -gt "$TOTAL" ]; then
       END="$TOTAL"
     fi
@@ -1164,4 +1178,4 @@ esac
 EOF
 
 chmod +x "$HOME/.local/bin/tv"
-echo ">>> TV 3.70 installed. Run: tv"
+echo ">>> TV 3.71 installed. Run: tv"
