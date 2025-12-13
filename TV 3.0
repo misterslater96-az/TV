@@ -1,36 +1,130 @@
 bash << 'EOF'
-set -e
+set -euo pipefail
 
+echo "============================================"
+echo " TV 4.1 FULL UNINSTALL (w/ backup) + INSTALL TV 4.2"
+echo "============================================"
+
+TV_DIR="$HOME/TV"
+RECDIR="$TV_DIR/recordings"
+REC_PIDFILE="$TV_DIR/recording.pid"
+
+# ----------------------------
+# 0) Stop running TV/mpv/ffmpeg that belong to this setup
+# ----------------------------
+echo ">>> Stopping any active LIVE recording..."
+if [ -f "$REC_PIDFILE" ]; then
+  pid="$(cat "$REC_PIDFILE" 2>/dev/null || true)"
+  if [ -n "${pid:-}" ] && kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null || true
+    sleep 1
+  fi
+  rm -f "$REC_PIDFILE" || true
+fi
+
+echo ">>> Killing any leftover ffmpeg that is writing into ~/TV/recordings ..."
+ps ax -o pid= -o args= | awk -v rec="$RECDIR" '
+  index($0,"ffmpeg") && index($0,rec) {print $1}
+' | while read -r p; do
+  [ -n "$p" ] && kill "$p" 2>/dev/null || true
+done
+
+echo ">>> Killing any running 'tv' launcher (if any)..."
+pkill -f "$HOME/.local/bin/tv" 2>/dev/null || true
+sleep 0.5
+
+# ----------------------------
+# 1) Backup existing TV folder (so recordings/timers aren't lost)
+# ----------------------------
+TS="$(date +"%Y%m%d_%H%M%S")"
+BACKUP_DIR="$HOME/TV.backup.$TS"
+
+if [ -d "$TV_DIR" ]; then
+  echo ">>> Backing up $TV_DIR -> $BACKUP_DIR"
+  mv "$TV_DIR" "$BACKUP_DIR"
+else
+  echo ">>> No ~/TV folder found (ok)."
+fi
+
+# ----------------------------
+# 2) Remove installed launcher(s)
+# ----------------------------
+echo ">>> Removing ~/.local/bin/tv"
+rm -f "$HOME/.local/bin/tv" 2>/dev/null || true
+
+echo ">>> Removing possible desktop launchers (if they exist)..."
+rm -f "$HOME/.local/share/applications/tv.desktop" 2>/dev/null || true
+rm -f "$HOME/Desktop/tv.desktop" 2>/dev/null || true
+
+# ----------------------------
+# 3) Purge main apt deps that this TV stack commonly installed
+#    (Safe list: avoids ripping out curl/python3)
+# ----------------------------
+if command -v apt >/dev/null 2>&1; then
+  echo ">>> Purging apt packages (mpv, fzf, ffmpeg, thunar) ..."
+  sudo apt remove --purge -y mpv fzf ffmpeg thunar || true
+  echo ">>> Autoremoving unused deps..."
+  sudo apt autoremove -y || true
+else
+  echo "!!! apt not found. Skipping package purge."
+fi
+
+# ----------------------------
+# 4) Reinstall deps
+# ----------------------------
+if command -v apt >/dev/null 2>&1; then
+  echo ">>> Installing deps..."
+  sudo apt update
+  sudo apt install -y mpv curl thunar fzf ffmpeg python3
+fi
+
+# ----------------------------
+# 5) Install TV 4.2 (fresh)
+# ----------------------------
+echo ">>> Installing TV 4.2 to ~/.local/bin/tv ..."
 mkdir -p "$HOME/.local/bin"
 
 cat > "$HOME/.local/bin/tv" << 'TVEOF'
 #!/usr/bin/env bash
-# TV 4.1 Runtime
-# - TVpass curated list + EPG
-# - Clickable everything via fzf (main menu, channels, global)
-# - Faux GUI: emojis, blocky menu, breadcrumb nav at top
-# - DVR: live toggle + scheduled + series timers
-# - HDD/SSD-aware background recording limits
-# - mpv call simplified so it actually plays (no over-quiet weirdness)
+# TV 4.2 Runtime
+# Upgrades over 4.1:
+# - Clickable "⬅ Back" rows (no more trapped pages)
+# - Local 12-hour clock shown in headers/prompts (screen-wide vibe)
+# - Quick Guide fixed: one channel line + 4 blocks (no repeated channel numbers)
+# - Quick Guide clickable to play
+# - NEW: Channel Guide (24h) from Home
+#   - Select time block -> Record Single (+30s auto) OR Record Series
+# - NEW: 1080p HDTV section auto-built from Global index, categorized by keywords
+# - Global search + timers screens get better emoji/boxing
+
+set -euo pipefail
 
 TV_DIR="$HOME/TV"
+
+# TVpass
 PLAYLIST="$TV_DIR/playlist.m3u"
 EPG="$TV_DIR/epg.xml"
 TVPASS_PLS="https://tvpass.org/playlist/m3u"
 TVPASS_EPG="https://tvpass.org/epg.xml"
-INPUT_CONF="$TV_DIR/tv-input.conf"
-RECDIR="$TV_DIR/recordings"
-REC_PIDFILE="$TV_DIR/recording.pid"
-GUIDE_CACHE="$TV_DIR/guide-cache.txt"
-NOW_CACHE="$TV_DIR/now-cache.txt"
-EPG4_CACHE="$TV_DIR/epg-four.txt"
-NAME_NOW_CACHE="$TV_DIR/now-by-name.txt"
-TIMERS_DB="$TV_DIR/timers.db"
 
+# Global (iptv-org)
 MAIN_PLAYLIST="$TV_DIR/main.m3u"
 GLOBAL_INDEX="$TV_DIR/global-index.m3u"
 MAIN_URL="https://iptv-org.github.io/iptv/countries/us.m3u"
 GLOBAL_INDEX_URL="https://iptv-org.github.io/iptv/index.m3u"
+
+# Runtime
+INPUT_CONF="$TV_DIR/tv-input.conf"
+RECDIR="$TV_DIR/recordings"
+REC_PIDFILE="$TV_DIR/recording.pid"
+TIMERS_DB="$TV_DIR/timers.db"
+
+# Caches
+NOW_CACHE="$TV_DIR/now-cache.txt"           # num \t name \t now-title
+EPG4_CACHE="$TV_DIR/epg-four.txt"           # num \t NOW \t NEXT \t AFTER \t LATER
+GUIDE_LIST_CACHE="$TV_DIR/guide-list.txt"   # quick guide rows (one per channel)
+GUIDE24_MAP="$TV_DIR/guide24-map.tsv"       # per-channel 24h map for recording
+HD1080_DB="$TV_DIR/hd1080.tsv"              # name \t url \t cat
 
 mkdir -p "$TV_DIR" "$RECDIR"
 
@@ -39,16 +133,18 @@ STORAGE_TIER="hdd"
 MAX_BG_RECORDINGS=3
 MAX_LIVE_RECORDINGS=1
 
+clock12() { date '+%-I:%M %p'; }
+
 #########################################
 # STORAGE TIER (HDD vs SSD)
 #########################################
 detect_storage_tier() {
   local dev base rota
-  dev=$(df --output=source "$TV_DIR" 2>/dev/null | tail -n1)
-  [ -z "$dev" ] && { STORAGE_TIER="hdd"; MAX_BG_RECORDINGS=3; return; }
+  dev=$(df --output=source "$TV_DIR" 2>/dev/null | tail -n1 || true)
+  [ -z "${dev:-}" ] && { STORAGE_TIER="hdd"; MAX_BG_RECORDINGS=3; return; }
   base="${dev%%[0-9p]*}"
-  rota=$(lsblk -ndo ROTA "$base" 2>/dev/null | head -n1)
-  case "$rota" in
+  rota=$(lsblk -ndo ROTA "$base" 2>/dev/null | head -n1 || true)
+  case "${rota:-}" in
     0) STORAGE_TIER="ssd"; MAX_BG_RECORDINGS=6 ;;
     1) STORAGE_TIER="hdd"; MAX_BG_RECORDINGS=3 ;;
     *) STORAGE_TIER="hdd"; MAX_BG_RECORDINGS=3 ;;
@@ -73,56 +169,20 @@ prevent_sleep() {
 }
 
 #########################################
-# DEPS: mpv, curl, thunar, fzf
+# DEPS
 #########################################
 ensure_deps() {
-  local need_base=0 need_fzf=0
-  command -v mpv    >/dev/null 2>&1 || need_base=1
-  command -v curl   >/dev/null 2>&1 || need_base=1
-  command -v thunar >/dev/null 2>&1 || need_base=1
-  command -v fzf    >/dev/null 2>&1 || need_fzf=1
+  local need=0
+  command -v mpv    >/dev/null 2>&1 || need=1
+  command -v curl   >/dev/null 2>&1 || need=1
+  command -v fzf    >/dev/null 2>&1 || need=1
+  command -v ffmpeg >/dev/null 2>&1 || need=1
+  command -v python3 >/dev/null 2>&1 || need=1
 
-  if [ "$need_base" -eq 1 ] && command -v apt >/dev/null 2>&1; then
-    echo ">>> Installing mpv, curl, thunar..."
+  if [ "$need" -eq 1 ] && command -v apt >/dev/null 2>&1; then
     sudo apt update
-    sudo apt install -y mpv curl thunar
+    sudo apt install -y mpv curl fzf ffmpeg python3 thunar
   fi
-
-  if [ "$need_fzf" -eq 1 ] && command -v apt >/dev/null 2>&1; then
-    echo ">>> Installing fzf for clickable UI..."
-    sudo apt install -y fzf || true
-  fi
-}
-
-#########################################
-# DISCLAIMER
-#########################################
-show_disclaimer() {
-  clear
-  cat << 'EOD'
-████████████████████████████████████████████████
-█ 📺  TV 4.1 – CLICKABLE TIVO-BRAIN TERMINAL  █
-████████████████████████████████████████████████
-
-Controls (everywhere fzf is used):
-  • Mouse or ↑/↓ → move
-  • Enter        → select
-  • Esc          → cancel/back
-
-While watching:
-  • Ctrl+Up / Ctrl+Down → surf channels
-  • 1 or r              → toggle LIVE recording
-  • q / Esc             → back to menu
-
-DVR:
-  • Live toggle with 1 / r (one live at a time)
-  • Timers via daily guide & "record all Name"
-  • Background recordings limited by disk type:
-       HDD → 3 at once
-       SSD → 6 at once
-
-EOD
-  read -rp "Press ENTER to continue... " _
 }
 
 #########################################
@@ -160,6 +220,9 @@ tvpass_update_all() {
   exit 0
 }
 
+#########################################
+# TABLE BUILDER (TVPASS)
+#########################################
 build_table() {
   local TMP
   TMP=$(mktemp)
@@ -177,21 +240,20 @@ build_table() {
 }
 
 #########################################
-# GUIDE CACHES (Python)
+# EPG CACHES + QUICK GUIDE (ONE LINE / CHANNEL)
 #########################################
-build_guide_cache() {
+build_epg_caches_and_quickguide() {
   local TABLE="$1"
-  : > "$GUIDE_CACHE"
   : > "$NOW_CACHE"
   : > "$EPG4_CACHE"
-  : > "$NAME_NOW_CACHE"
+  : > "$GUIDE_LIST_CACHE"
 
-  python3 - "$EPG" "$TABLE" "$GUIDE_CACHE" "$NOW_CACHE" "$EPG4_CACHE" "$NAME_NOW_CACHE" << 'PY'
+  python3 - "$EPG" "$TABLE" "$NOW_CACHE" "$EPG4_CACHE" "$GUIDE_LIST_CACHE" << 'PY'
 import sys, re
 from datetime import datetime
 import xml.etree.ElementTree as ET
 
-epg_path, table_path, guide_path, now_path, four_path, name_now_path = sys.argv[1:]
+epg_path, table_path, now_path, four_path, qg_path = sys.argv[1:]
 
 tree = ET.parse(epg_path)
 root = tree.getroot()
@@ -246,7 +308,7 @@ def parse_dt(s):
 
 now = datetime.now().astimezone()
 
-def blocks_from_now(cid):
+def next_blocks(cid, limit=4):
     progs = progs_by_id.get(cid,[])
     out = []
     for p in progs:
@@ -258,44 +320,45 @@ def blocks_from_now(cid):
         title = (t_el.text.strip() if (t_el is not None and t_el.text) else "")
         if title:
             out.append((st,en,title))
-        if len(out) >= 4:
+        if len(out) >= limit:
             break
     return out
 
+def human(st,en):
+    return f"{st.strftime('%-I:%M %p')}-{en.strftime('%-I:%M %p')}"
+
 with open(table_path,"r",encoding="utf-8") as tf, \
-     open(guide_path,"w",encoding="utf-8") as gf, \
      open(now_path,"w",encoding="utf-8") as nf, \
      open(four_path,"w",encoding="utf-8") as ff, \
-     open(name_now_path,"w",encoding="utf-8") as nfname:
+     open(qg_path,"w",encoding="utf-8") as qg:
 
-    seen = set()
     for line in tf:
         parts = line.rstrip("\n").split("\t")
         if len(parts) < 3: continue
         num,name,url = parts[0],parts[1],parts[2]
-        if not num: continue
         cid = find_channel_id(name)
-        if not cid: continue
-        blocks = blocks_from_now(cid)
-        if not blocks: continue
+        if not cid: 
+            continue
+        blocks = next_blocks(cid, 4)
+        if not blocks:
+            continue
 
         titles = [b[2] for b in blocks]
+        while len(titles) < 4:
+            titles.append("")
 
         nf.write(f"{num}\t{name}\t{titles[0]}\n")
+        ff.write(f"{num}\t{titles[0]}\t{titles[1]}\t{titles[2]}\t{titles[3]}\n")
 
-        key = canon_name(name)
-        if key and key not in seen:
-            nfname.write(f"{key}\t{titles[0]}\n")
-            seen.add(key)
-
-        four_titles = titles + [""]*(4-len(titles))
-        ff.write(f"{num}\t" + "\t".join(four_titles[:4]) + "\n")
-
-        for st,en,title in blocks:
-            tstr = f"{st.strftime('%-I:%M %p')}-{en.strftime('%-I:%M %p')}"
-            gf.write(f"\x1b[96m{num}. {name}\x1b[0m\n")
-            gf.write(f"   {tstr}  {title}\n")
-        gf.write("\n")
+        # Quick Guide row: ONE channel line + 4 blocks
+        # Format: [ 17] 📺 Name | 8:00 PM Show | 8:30 PM Show | ...
+        segs = []
+        for st,en,title in blocks[:4]:
+            segs.append(f"{st.strftime('%-I:%M %p')} {title[:34]}")
+        while len(segs) < 4:
+            segs.append("")
+        row = f"[{int(num):3d}] 📺 {name[:32]:32s} | {segs[0]:40s} | {segs[1]:40s} | {segs[2]:40s} | {segs[3]:40s}"
+        qg.write(row.rstrip()+"\n")
 PY
 }
 
@@ -333,7 +396,8 @@ start_recording() {
   local chsafe showsafe day ts dir outfile
   chsafe=$(echo "$chan" | tr ' /' '__' | tr -cd 'A-Za-z0-9_.-')
   [ -z "$chsafe" ] && chsafe="Channel"
-  [ -n "$show" ] && showsafe=$(echo "$show" | tr ' /' '__' | tr -cd 'A-Za-z0-9_.-')
+  showsafe=""
+  [ -n "${show:-}" ] && showsafe=$(echo "$show" | tr ' /' '__' | tr -cd 'A-Za-z0-9_.-')
   day=$(date +"%Y-%m-%d")
   ts=$(date +"%Y-%m-%d_%H-%M-%S")
   dir="$RECDIR/$chsafe/$day"
@@ -376,18 +440,19 @@ toggle_recording() {
   else
     RECORD_CONFIRM=""
     local show=""
-    [ -n "$num" ] && show=$(now_title_for_num "$num")
+    [ -n "${num:-}" ] && show=$(now_title_for_num "$num" || true)
     start_recording "$url" "$chan" "$show"
   fi
 }
 
 #########################################
-# SCHEDULED RECORDING (BLOCKS)
+# SCHEDULED RECORDING (BLOCKS) +30s option
 #########################################
 schedule_record_block() {
-  local url="$1" chan="$2" show="$3" start_ts="$4" end_ts="$5" label="$6"
+  local url="$1" chan="$2" show="$3" start_ts="$4" end_ts="$5" label="$6" pad_end="${7:-0}"
   local now_ts duration delay
   now_ts=$(date +%s)
+  end_ts=$((end_ts + pad_end))
   duration=$((end_ts - start_ts))
   [ "$duration" -le 0 ] && { echo "Block already done."; return; }
   delay=$((start_ts - now_ts))
@@ -396,10 +461,12 @@ schedule_record_block() {
     duration=$((end_ts - now_ts))
     [ "$duration" -le 0 ] && { echo "Block already finished."; return; }
   fi
+
   local chsafe showsafe day ts dir outfile
   chsafe=$(echo "$chan" | tr ' /' '__' | tr -cd 'A-Za-z0-9_.-')
   [ -z "$chsafe" ] && chsafe="Channel"
-  [ -n "$show" ] && showsafe=$(echo "$show" | tr ' /' '__' | tr -cd 'A-Za-z0-9_.-')
+  showsafe=""
+  [ -n "${show:-}" ] && showsafe=$(echo "$show" | tr ' /' '__' | tr -cd 'A-Za-z0-9_.-')
   day=$(date -d "@$start_ts" +"%Y-%m-%d")
   ts=$(date -d "@$start_ts" +"%Y-%m-%d_%H-%M-%S")
   dir="$RECDIR/$chsafe/$day"
@@ -428,9 +495,12 @@ schedule_record_block() {
     ffmpeg -nostdin -y -i \"$url\" -t $duration -c copy \"$outfile\" >/dev/null 2>&1
   " >/dev/null 2>&1 &
 
-  echo ">>> TIMER scheduled: $chan"
-  echo "    Block: $label – $show"
-  echo "    File:  $outfile"
+  echo ">>> ✅ TIMER scheduled: $chan"
+  echo "    🧱 Block: $label – $show"
+  echo "    📁 File:  $outfile"
+  if [ "$pad_end" -gt 0 ]; then
+    echo "    ⏱ End padding: +${pad_end}s"
+  fi
 }
 
 #########################################
@@ -438,7 +508,8 @@ schedule_record_block() {
 #########################################
 add_series_timer() {
   local num="$1" title="$2"
-  [ -z "$num" ] || [ -z "$title" ] && return
+  [ -z "${num:-}" ] && return
+  [ -z "${title:-}" ] && return
   mkdir -p "$TV_DIR"
   local norm
   norm=$(printf '%s\n' "$title" | sed 's/^ *//;s/ *$//')
@@ -452,23 +523,35 @@ add_series_timer() {
     return
   fi
   echo -e "${num}\t${norm}" >> "$TIMERS_DB"
-  echo ">>> Added series timer: ch ${num} – ${norm}"
+  echo ">>> ✅ Added series timer: ch ${num} – ${norm}"
 }
 
 timers_list() {
+  clear
+  echo "╔════════════════════════════════════════╗"
+  echo "║ ⏱  TV ▸ Timers ▸ List     $(clock12)     ║"
+  echo "╚════════════════════════════════════════╝"
+  echo
   if [ ! -s "$TIMERS_DB" ]; then
     echo "No series timers."
+    echo
+    read -rp "ENTER..." _
     return
   fi
-  echo "⏱ Series Timers:"
-  echo "-----------------------------"
   nl -ba "$TIMERS_DB" | sed 's/\t/  →  /'
+  echo
+  read -rp "ENTER..." _
 }
 
 timers_scan() {
+  clear
+  echo "╔════════════════════════════════════════╗"
+  echo "║ 🔁  TV ▸ Timers ▸ Scan EPG  $(clock12)   ║"
+  echo "╚════════════════════════════════════════╝"
+  echo
   tvpass_ensure_playlist
   tvpass_ensure_guide
-  [ ! -s "$TIMERS_DB" ] && { echo "No timers to scan."; return; }
+  [ ! -s "$TIMERS_DB" ] && { echo "No timers to scan."; echo; read -rp "ENTER..." _; return; }
 
   local TABLE TMP
   TABLE=$(build_table)
@@ -501,16 +584,16 @@ for ch in root.findall("channel"):
     channels.append((cid,names))
 
 def find_channel_id(name):
-    name = (name or "").strip()
+    name=(name or "").strip()
     if not name: return None
     for cid,names in channels:
         for dn in names:
             if dn == name:
                 return cid
-    short = canon_name(name)
+    short=canon_name(name)
     if not short: return None
     for cid,names in channels:
-        joined = " ".join(n for n in names if n)
+        joined=" ".join(n for n in names if n)
         if short and short in canon_name(joined):
             return cid
     return None
@@ -530,18 +613,17 @@ def parse_dt(s):
             continue
     return None
 
-num_to_name = {}
+num_to_name={}
 with open(table_path,"r",encoding="utf-8") as tf:
     for line in tf:
-        parts = line.rstrip("\n").split("\t")
-        if len(parts) < 2: continue
-        num,name = parts[0],parts[1]
-        num_to_name[num] = name
+        parts=line.rstrip("\n").split("\t")
+        if len(parts)<2: continue
+        num_to_name[parts[0]]=parts[1]
 
-now = datetime.now().astimezone()
-horizon = now + timedelta(days=2)
+now=datetime.now().astimezone()
+horizon=now+timedelta(days=2)
 
-def human_label(st,en):
+def human(st,en):
     return f"{st.strftime('%-I:%M %p')}-{en.strftime('%-I:%M %p')}"
 
 with open(timers_path,"r",encoding="utf-8") as tf:
@@ -550,47 +632,48 @@ with open(timers_path,"r",encoding="utf-8") as tf:
         if not line: continue
         parts=line.split("\t",1)
         if len(parts)<2: continue
-        num,title = parts[0],parts[1].strip()
-        chan_name = num_to_name.get(num)
+        num,title=parts[0],parts[1].strip()
+        chan_name=num_to_name.get(num)
         if not chan_name: continue
-        cid = find_channel_id(chan_name)
+        cid=find_channel_id(chan_name)
         if not cid: continue
-        progs = progs_by_id.get(cid,[])
-        wanted = title.lower()
-        for p in progs:
-            st = parse_dt(p.get("start"))
-            en = parse_dt(p.get("stop"))
+        wanted=title.lower()
+        for p in progs_by_id.get(cid,[]):
+            st=parse_dt(p.get("start")); en=parse_dt(p.get("stop"))
             if not st or not en: continue
             if en<=now or st>=horizon: continue
             t_el=p.find("title")
             ttxt=(t_el.text.strip() if (t_el is not None and t_el.text) else "")
             if not ttxt: continue
             if ttxt.strip().lower()!=wanted: continue
-            label = human_label(st,en)
-            print(f"{num}\t{int(st.timestamp())}\t{int(en.timestamp())}\t{ttxt}\t{label}")
+            print(f"{num}\t{int(st.timestamp())}\t{int(en.timestamp())}\t{ttxt}\t{human(st,en)}")
 PY
 
   if [ ! -s "$TMP" ]; then
     echo "No upcoming episodes found."
     rm -f "$TMP" "$TABLE"
+    echo
+    read -rp "ENTER..." _
     return
   fi
 
   echo ">>> Scheduling episodes..."
   while IFS=$'\t' read -r NUM ST_TS EN_TS TITLE LABEL; do
-    [ -z "$NUM" ] && continue
-    local NAME URL
+    [ -z "${NUM:-}" ] && continue
     NAME=$(awk -F'\t' -v i="$NUM" '$1==i{print $2}' "$TABLE")
     URL=$(awk -F'\t' -v i="$NUM" '$1==i{print $3}' "$TABLE")
-    [ -z "$URL" ] && continue
+    [ -z "${URL:-}" ] && continue
     schedule_record_block "$URL" "$NAME" "$TITLE" "$ST_TS" "$EN_TS" "$LABEL"
   done < "$TMP"
 
   rm -f "$TMP" "$TABLE"
+  echo
+  echo "Done."
+  read -rp "ENTER..." _
 }
 
 #########################################
-# PLAY CHANNEL (TVPASS)
+# WATCHING (TVPASS)
 #########################################
 play_channel() {
   local CUR="$1" TABLE="$2"
@@ -603,24 +686,23 @@ play_channel() {
 
     clear
     echo "╔════════════════════════════════════════╗"
-    echo "║ TV ▸ TVpass ▸ Watching                 ║"
+    printf "║ TV ▸ TVpass ▸ Watching   %-10s ║\n" "$(clock12)"
     echo "╚════════════════════════════════════════╝"
     echo -e "\e[96m▶ Channel $CUR: $NAME\e[0m"
     echo
     epg_now_next_block "$CUR"
     echo
     recording_active && echo -e "   \e[91m● LIVE RECORDING (1/r to stop)\e[0m\n"
+
+    # “Clickable buttons” in TUI reality = obvious labeled controls:
     echo "   Ctrl+Up/Down → surf | 1/r → live rec | q/Esc → back"
+    echo "   ⬆ Channel Up (Ctrl+Up)   ⬇ Channel Down (Ctrl+Down)   ❌ Cancel Watch (q/Esc)"
     echo
 
-    if [ -z "$URL" ]; then
-      echo "!!! No URL for channel $CUR"
-      read -rp "Press ENTER..." _
-      break
-    fi
+    [ -z "${URL:-}" ] && { echo "!!! No URL for channel $CUR"; read -rp "ENTER..." _; break; }
 
     mpv --fullscreen --input-conf="$INPUT_CONF" "$URL"
-    local code=$?
+    code=$?
     case "$code" in
       3) CUR=$((CUR+1)); [ "$CUR" -gt "$LAST" ] && CUR=1 ;;
       4) CUR=$((CUR-1)); [ "$CUR" -lt 1 ] && CUR="$LAST" ;;
@@ -631,164 +713,9 @@ play_channel() {
 }
 
 #########################################
-# DAILY GUIDE (TVPASS)
+# CLICKABLE TVPASS CHANNEL LIST (with Back row)
 #########################################
-channel_full_guide() {
-  local NUM="$1" TABLE="$2"
-  local NAME URL MAP
-  NAME=$(awk -F'\t' -v i="$NUM" '$1==i{print $2}' "$TABLE")
-  URL=$(awk -F'\t' -v i="$NUM" '$1==i{print $3}' "$TABLE")
-  [ -z "$NAME" ] && { echo "No such channel."; read -rp "ENTER..." _; return; }
-
-  MAP=$(mktemp)
-  clear
-  echo "╔════════════════════════════════════════╗"
-  echo "║ TV ▸ TVpass ▸ Guide ▸ $NUM             ║"
-  echo "╚════════════════════════════════════════╝"
-  echo -e "\e[93mDaily guide for $NUM – $NAME\e[0m"
-  echo
-
-  python3 - "$EPG" "$NAME" "$MAP" << 'PY'
-import sys, re
-from datetime import datetime, timedelta
-import xml.etree.ElementTree as ET
-
-epg_path, playlist_name, map_path = sys.argv[1:]
-
-tree = ET.parse(epg_path)
-root = tree.getroot()
-
-def canon_name(s: str) -> str:
-    s = s or ""
-    s = re.sub(r"\[[^\]]*\]", " ", s)
-    s = re.sub(r"\([^)]*\)", " ", s)
-    s = re.sub(r"[-–_|]", " ", s)
-    for token in ["HD","East","West","US","USA","Feed","TV","Channel","Network","Latino"]:
-        s = re.sub(r"\b"+re.escape(token)+r"\b"," ",s,flags=re.I)
-    s = re.sub(r"\s+"," ",s).strip().lower()
-    return s
-
-def find_channel_id(name):
-    name=(name or "").strip()
-    if not name: return None
-    chans=[]
-    for ch in root.findall("channel"):
-        cid=ch.get("id","")
-        names=[dn.text.strip() for dn in ch.findall("display-name") if dn.text]
-        chans.append((cid,names))
-    for cid,names in chans:
-        for dn in names:
-            if dn == name:
-                return cid
-    short=canon_name(name)
-    if not short: return None
-    for cid,names in chans:
-        joined=" ".join(n for n in names if n)
-        if short and short in canon_name(joined):
-            return cid
-    return None
-
-def parse_dt(s):
-    if not s: return None
-    for fmt in ("%Y%m%d%H%M%S %z","%Y%m%d%H%M%S%z"):
-        try:
-            return datetime.strptime(s,fmt).astimezone()
-        except Exception:
-            continue
-    return None
-
-cid = find_channel_id(playlist_name)
-if not cid: sys.exit(0)
-
-progs=[p for p in root.findall("programme") if p.get("channel")==cid]
-now=datetime.now().astimezone()
-start_day=now.replace(hour=0,minute=0,second=0,microsecond=0)
-end_day=start_day+timedelta(days=1)
-
-rows=[]
-for p in progs:
-    st=parse_dt(p.get("start"))
-    en=parse_dt(p.get("stop"))
-    if not st or not en: continue
-    if en<=start_day or st>=end_day: continue
-    t_el=p.find("title")
-    title=(t_el.text.strip() if (t_el is not None and t_el.text) else "")
-    if not title: continue
-    st_clip=max(st,start_day)
-    en_clip=min(en,end_day)
-    rows.append((st_clip,en_clip,title))
-
-rows.sort(key=lambda r:r[0])
-
-def human_label(st,en):
-    return f"{st.strftime('%-I:%M %p')}-{en.strftime('%-I:%M %p')}"
-
-with open(map_path,"w",encoding="utf-8") as mf:
-    for st,en,title in rows:
-        key=(st.strftime("%-I:%M%p")+"-"+en.strftime("%-I:%M%p")).lower().replace(" ","")
-        label=human_label(st,en)
-        mf.write(f"{key}\t{int(st.timestamp())}\t{int(en.timestamp())}\t{label}\t{title}\n")
-
-for st,en,title in rows:
-    print(f"  {human_label(st,en)}  {title}")
-PY
-
-  echo
-  echo "record 6:30pm-7:00pm   → schedule that block"
-  echo "record all Family Guy  → series timer"
-  echo "ENTER                   → back"
-  echo
-
-  while true; do
-    local CMD
-    read -rp "daily-guide> " CMD
-    [ -z "$CMD" ] && break
-    case "$CMD" in
-      [Rr]ecord\ all\ *)
-        local TITLE
-        TITLE=${CMD#*[Rr]ecord all }
-        TITLE=$(echo "$TITLE" | sed 's/^ *//;s/ *$//')
-        [ -z "$TITLE" ] && { echo "Need show name."; continue; }
-        add_series_timer "$NUM" "$TITLE"
-        ;;
-      [Rr]ecord\ *)
-        local ARG KEY INFO ST_TS EN_TS LABEL TITLE
-        ARG=${CMD#*[Rr]ecord }
-        KEY=$(echo "$ARG" | tr -d ' ' | tr 'A-Z' 'a-z')
-        [ -z "$KEY" ] && { echo "Need time range."; continue; }
-        INFO=$(awk -F'\t' -v k="$KEY" '$1==k{print;exit}' "$MAP")
-        [ -z "$INFO" ] && { echo "No matching time block."; continue; }
-        IFS=$'\t' read -r _ ST_TS EN_TS LABEL TITLE <<< "$INFO"
-        schedule_record_block "$URL" "$NAME" "$TITLE" "$ST_TS" "$EN_TS" "$LABEL"
-        ;;
-      *)
-        echo "Use: record HH:MMam-HH:MMpm or record all Name"
-        ;;
-    esac
-  done
-
-  rm -f "$MAP"
-}
-
-#########################################
-# RECORDINGS FOLDER
-#########################################
-open_recordings() {
-  echo ">>> Opening $RECDIR"
-  if command -v thunar >/dev/null 2>&1; then
-    thunar "$RECDIR" >/dev/null 2>&1 &
-  elif command -v xdg-open >/dev/null 2>&1; then
-    xdg-open "$RECDIR" >/dev/null 2>&1 &
-  else
-    echo "Open manually: $RECDIR"
-  fi
-  read -rp "ENTER to return..." _
-}
-
-#########################################
-# CHANNEL LIST (PRINT + CLICK)
-#########################################
-print_channel_list() {
+print_tvpass_channel_rows() {
   local TABLE="$1"
   if [ -f "$NOW_CACHE" ]; then
     awk -F'\t' '
@@ -797,43 +724,228 @@ print_channel_list() {
         num=$1; name=$2
         if (num=="") next
         if (num in now)
-          printf "[%3s] 📺 %-30s \033[92m%.40s\033[0m\n", num, name, now[num]
+          printf "[%3s] 📺 %-32s  \033[92m%.46s\033[0m\n", num, name, now[num]
         else
           printf "[%3s] 📺 %s\n", num, name
       }
     ' "$NOW_CACHE" "$TABLE"
   else
-    awk -F'\t' '
-      {
-        num=$1; name=$2
-        if (num=="") next
-        printf "[%3s] 📺 %s\n", num, name
-      }
-    ' "$TABLE"
+    awk -F'\t' '{ if($1!="") printf "[%3s] 📺 %s\n", $1, $2 }' "$TABLE"
   fi
+  printf "[---] ⬅ Back\n"
 }
 
-choose_channel_clickable() {
+choose_tvpass_channel() {
   local TABLE="$1"
-  if ! command -v fzf >/dev/null 2>&1; then
-    echo "fzf not installed; no clickable mode."
-    read -rp "ENTER..." _
-    return 1
-  fi
   local choice
   choice=$(
-    print_channel_list "$TABLE" |
+    print_tvpass_channel_rows "$TABLE" |
     fzf --ansi \
-        --prompt="TV ▸ TVpass ▸ Channels > " \
-        --header="Use mouse or arrows, ENTER to tune, ESC to cancel" \
+        --prompt="TV ▸ TVpass ▸ Channels ($(clock12)) > " \
+        --header="Mouse/arrows: move • ENTER: tune • ESC: back" \
         --height=100% --reverse --border
-  )
-  [ -z "$choice" ] && return 1
+  ) || true
+  [ -z "${choice:-}" ] && return 1
+  if echo "$choice" | grep -q "⬅ Back"; then
+    return 1
+  fi
   echo "$choice" | sed 's/^\[\s*\([0-9]\+\)\].*/\1/' 2>/dev/null
 }
 
 #########################################
-# IPTV-ORG GLOBAL (CLICKABLE)
+# 24H CHANNEL GUIDE (TVPASS) + RECORD CHOOSER
+#########################################
+build_channel_24h_map() {
+  local chan_name="$1"
+  : > "$GUIDE24_MAP"
+  python3 - "$EPG" "$chan_name" "$GUIDE24_MAP" << 'PY'
+import sys, re
+from datetime import datetime, timedelta
+import xml.etree.ElementTree as ET
+
+epg_path, chan_name, out_path = sys.argv[1:]
+tree=ET.parse(epg_path); root=tree.getroot()
+
+def canon(s:str)->str:
+    s=s or ""
+    s=re.sub(r"\[[^\]]*\]"," ",s)
+    s=re.sub(r"\([^)]*\)"," ",s)
+    s=re.sub(r"[-–_|]"," ",s)
+    s=re.sub(r"\s+"," ",s).strip().lower()
+    return s
+
+def parse_dt(s):
+    if not s: return None
+    for fmt in ("%Y%m%d%H%M%S %z","%Y%m%d%H%M%S%z"):
+        try: return datetime.strptime(s,fmt).astimezone()
+        except: pass
+    return None
+
+# find channel id
+cid=None
+for ch in root.findall("channel"):
+    names=[dn.text.strip() for dn in ch.findall("display-name") if dn.text]
+    if any(n==chan_name for n in names):
+        cid=ch.get("id"); break
+if not cid:
+    # fuzzy
+    want=canon(chan_name)
+    for ch in root.findall("channel"):
+        names=[dn.text.strip() for dn in ch.findall("display-name") if dn.text]
+        joined=" ".join(names)
+        if want and want in canon(joined):
+            cid=ch.get("id"); break
+
+if not cid:
+    open(out_path,"w").close()
+    sys.exit(0)
+
+now=datetime.now().astimezone()
+start=now.replace(hour=0,minute=0,second=0,microsecond=0)
+end=start+timedelta(days=1)
+
+rows=[]
+for p in root.findall("programme"):
+    if p.get("channel")!=cid: continue
+    st=parse_dt(p.get("start")); en=parse_dt(p.get("stop"))
+    if not st or not en: continue
+    if en<=start or st>=end: continue
+    t_el=p.find("title")
+    title=(t_el.text.strip() if (t_el is not None and t_el.text) else "")
+    if not title: continue
+    stc=max(st,start); enc=min(en,end)
+    rows.append((stc,enc,title))
+
+rows.sort(key=lambda r:r[0])
+
+def human(st,en):
+    return f"{st.strftime('%-I:%M %p')}–{en.strftime('%-I:%M %p')}"
+
+with open(out_path,"w",encoding="utf-8") as f:
+    for st,en,title in rows:
+        f.write(f"{int(st.timestamp())}\t{int(en.timestamp())}\t{human(st,en)}\t{title}\n")
+PY
+}
+
+channel_guide_24h() {
+  local NUM="$1" TABLE="$2"
+  local NAME URL
+  NAME=$(awk -F'\t' -v i="$NUM" '$1==i{print $2}' "$TABLE")
+  URL=$(awk -F'\t' -v i="$NUM" '$1==i{print $3}' "$TABLE")
+  [ -z "${NAME:-}" ] && return
+
+  build_channel_24h_map "$NAME"
+  if [ ! -s "$GUIDE24_MAP" ]; then
+    clear
+    echo "No 24h guide entries found for:"
+    echo "  $NUM – $NAME"
+    echo
+    read -rp "ENTER..." _
+    return
+  fi
+
+  local pick
+  pick=$(
+    awk -F'\t' '{printf "🧱 %s  %s\n", $3, $4}' "$GUIDE24_MAP" ; echo "⬅ Back" |
+    fzf --ansi \
+        --prompt="TV ▸ Guide24 ▸ $NUM ($(clock12)) > " \
+        --header="ENTER: choose a block • ESC: back" \
+        --height=100% --reverse --border
+  ) || true
+
+  [ -z "${pick:-}" ] && return
+  echo "$pick" | grep -q "⬅ Back" && return
+
+  # find block by label+title match
+  local label title st en
+  label=$(echo "$pick" | sed 's/^🧱 *\([^ ]* [AP]M–[^ ]* [AP]M\).*/\1/' || true)
+  title=$(echo "$pick" | sed 's/^🧱 *[^ ]* [AP]M–[^ ]* [AP]M  //' || true)
+
+  # locate exact
+  local row
+  row=$(awk -F'\t' -v t="$title" -v l="$label" '
+    $3==l && $4==t {print; exit}
+  ' "$GUIDE24_MAP" || true)
+  [ -z "${row:-}" ] && return
+  IFS=$'\t' read -r st en _lbl _title <<< "$row"
+
+  # second screen: record options
+  local action
+  action=$(
+    printf "%s\n" \
+      "🎬 Record SINGLE episode (+30s auto end)" \
+      "📺 Record SERIES (every matching title on this channel)" \
+      "⬅ Back" |
+    fzf --ansi \
+        --prompt="Record ▸ $NUM ($(clock12)) > " \
+        --header="Pick one" \
+        --height=40% --reverse --border
+  ) || true
+  [ -z "${action:-}" ] && return
+  echo "$action" | grep -q "⬅ Back" && return
+
+  case "$action" in
+    *SINGLE*)
+      schedule_record_block "$URL" "$NAME" "$title" "$st" "$en" "$label" 30
+      read -rp "ENTER..." _
+      ;;
+    *SERIES*)
+      add_series_timer "$NUM" "$title"
+      echo ">>> Tip: run Timers (scan EPG) to schedule upcoming episodes."
+      read -rp "ENTER..." _
+      ;;
+  esac
+}
+
+#########################################
+# QUICK GUIDE (CLICKABLE)
+#########################################
+quick_guide_clickable() {
+  if [ ! -s "$GUIDE_LIST_CACHE" ]; then
+    clear
+    echo "Quick Guide not built yet."
+    read -rp "ENTER..." _
+    return
+  fi
+  local pick
+  pick=$(
+    cat "$GUIDE_LIST_CACHE" ; echo "[---] ⬅ Back" |
+    fzf --ansi \
+        --prompt="TV ▸ Quick Guide ($(clock12)) > " \
+        --header="ENTER: play channel • Ctrl+G: 24h guide • ESC: back" \
+        --bind="ctrl-g:accept" \
+        --height=100% --reverse --border
+  ) || true
+
+  [ -z "${pick:-}" ] && return
+  echo "$pick" | grep -q "⬅ Back" && return
+
+  local num
+  num=$(echo "$pick" | sed 's/^\[\s*\([0-9]\+\)\].*/\1/' 2>/dev/null || true)
+  [ -z "${num:-}" ] && return
+
+  # If user hit Ctrl+G, fzf still returns the picked row; treat it as "open 24h guide"
+  # (works because header tells them)
+  # We can’t directly detect the key, so we do a small chooser:
+  local mode
+  mode=$(
+    printf "%s\n" \
+      "▶ Play channel now" \
+      "🗓️ Open 24h guide (record blocks)" \
+      "⬅ Back" |
+    fzf --ansi --prompt="Quick Guide ▸ Action ($(clock12)) > " --height=40% --reverse --border
+  ) || true
+  [ -z "${mode:-}" ] && return
+  echo "$mode" | grep -q "⬅ Back" && return
+
+  case "$mode" in
+    *Play*) play_channel "$num" "$TABLE" ;;
+    *24h*)  channel_guide_24h "$num" "$TABLE" ;;
+  esac
+}
+
+#########################################
+# IPTV-ORG GLOBAL (CLICKABLE) + 1080 HDTV
 #########################################
 iptv_ensure_playlist() {
   local file="$1" url="$2" label="$3"
@@ -860,7 +972,8 @@ iptv_build_tmp_from_playlist() {
 }
 
 iptv_play_channel() {
-  local IDX="$1" TABLE="$2" LAST NAME URL
+  local IDX="$1" TABLE="$2"
+  local LAST NAME URL
   LAST=$(awk 'END{print NR}' "$TABLE")
   while true; do
     NAME=$(awk -F'\t' -v i="$IDX" 'NR==i{print $1}' "$TABLE")
@@ -868,7 +981,7 @@ iptv_play_channel() {
 
     clear
     echo "╔════════════════════════════════════════╗"
-    echo "║ TV ▸ Global ▸ Watching                 ║"
+    printf "║ TV ▸ Global ▸ Watching    %-10s ║\n" "$(clock12)"
     echo "╚════════════════════════════════════════╝"
     echo -e "\e[96m▶ Global: $NAME\e[0m"
     echo
@@ -876,10 +989,10 @@ iptv_play_channel() {
     echo "   Ctrl+Up/Down → surf | 1/r → live rec | q/Esc → back"
     echo
 
-    [ -z "$URL" ] && { echo "No URL"; read -rp "ENTER..." _; break; }
+    [ -z "${URL:-}" ] && { echo "No URL"; read -rp "ENTER..." _; break; }
 
     mpv --fullscreen --input-conf="$INPUT_CONF" "$URL"
-    local code=$?
+    code=$?
     case "$code" in
       3) IDX=$((IDX+1)); [ "$IDX" -gt "$LAST" ] && IDX=1 ;;
       4) IDX=$((IDX-1)); [ "$IDX" -lt 1 ] && IDX="$LAST" ;;
@@ -891,114 +1004,37 @@ iptv_play_channel() {
 
 iptv_menu_clickable() {
   local TMP="$1" LABEL="$2"
-  if ! command -v fzf >/dev/null 2>&1; then
-    echo "fzf required for clickable global menu."
-    read -rp "ENTER..." _
-    return
-  fi
-  if [ ! -s "$TMP" ]; then
-    echo "No channels in $LABEL."
-    read -rp "ENTER..." _
-    return
-  fi
+  [ ! -s "$TMP" ] && { echo "No channels."; read -rp "ENTER..." _; return; }
 
   local choice idx
   choice=$(
-    awk -F'\t' '{
-      n=NR
-      printf "[%4d] 🌍 %s\n", n, $1
-    }' "$TMP" |
+    (awk -F'\t' '{printf "[%4d] 🌍 %s\n", NR, $1}' "$TMP"; echo "[----] ⬅ Back") |
     fzf --ansi \
-        --prompt="TV ▸ Global ▸ $LABEL > " \
-        --header="Click a channel, ENTER to play, ESC to back" \
+        --prompt="TV ▸ Global ▸ $LABEL ($(clock12)) > " \
+        --header="ENTER: play • ESC/back: return" \
         --height=100% --reverse --border
-  )
-  [ -z "$choice" ] && return
-  idx=$(echo "$choice" | sed 's/^\[\s*\([0-9]\+\)\].*/\1/')
-  [ -z "$idx" ] && return
+  ) || true
+  [ -z "${choice:-}" ] && return
+  echo "$choice" | grep -q "⬅ Back" && return
+
+  idx=$(echo "$choice" | sed 's/^\[\s*\([0-9]\+\)\].*/\1/' || true)
+  [ -z "${idx:-}" ] && return
   iptv_play_channel "$idx" "$TMP"
-}
-
-iptv_main_us() {
-  iptv_ensure_playlist "$MAIN_PLAYLIST" "$MAIN_URL" "US main"
-  local TMP
-  TMP=$(mktemp)
-  iptv_build_tmp_from_playlist "$MAIN_PLAYLIST" "$TMP"
-  iptv_menu_clickable "$TMP" "US"
-  rm -f "$TMP"
-}
-
-iptv_global_language_menu() {
-  while true; do
-    if ! command -v fzf >/dev/null 2>&1; then
-      echo "fzf required for clickable language menu."
-      read -rp "ENTER..." _
-      return
-    fi
-    local choice
-    choice=$(
-      printf '%s\n' \
-        "[1] 🌍 All languages" \
-        "[2] 🇺🇸 English" \
-        "[3] 🇪🇸 Spanish" \
-        "[4] 🇫🇷 French" \
-        "[5] 🇩🇪 German" \
-        "[6] 🇮🇹 Italian" \
-        "[7] 🇵🇹 Portuguese" \
-        "[8] 🇷🇺 Russian" \
-        "[9] 🇸🇦 Arabic" \
-        "[10] 🇨🇳 Chinese" \
-        "[11] 🇯🇵 Japanese" \
-        "[12] 🇰🇷 Korean" \
-        "[13] 🇮🇳 Hindi" \
-        "[14] ⬅ Back" |
-      fzf --ansi \
-          --prompt="TV ▸ Global ▸ Languages > " \
-          --header="Pick a language group" \
-          --height=100% --reverse --border
-    )
-    [ -z "$choice" ] && return
-    case "$choice" in
-      *"[1]"*)  SRC_URL="$GLOBAL_INDEX_URL"; SRC_FILE="$GLOBAL_INDEX"; LANG_LABEL="All" ;;
-      *"[2]"*)  SRC_URL="https://iptv-org.github.io/iptv/languages/eng.m3u"; SRC_FILE="$TV_DIR/global-eng.m3u"; LANG_LABEL="English" ;;
-      *"[3]"*)  SRC_URL="https://iptv-org.github.io/iptv/languages/spa.m3u"; SRC_FILE="$TV_DIR/global-spa.m3u"; LANG_LABEL="Spanish" ;;
-      *"[4]"*)  SRC_URL="https://iptv-org.github.io/iptv/languages/fra.m3u"; SRC_FILE="$TV_DIR/global-fra.m3u"; LANG_LABEL="French" ;;
-      *"[5]"*)  SRC_URL="https://iptv-org.github.io/iptv/languages/deu.m3u"; SRC_FILE="$TV_DIR/global-deu.m3u"; LANG_LABEL="German" ;;
-      *"[6]"*)  SRC_URL="https://iptv-org.github.io/iptv/languages/ita.m3u"; SRC_FILE="$TV_DIR/global-ita.m3u"; LANG_LABEL="Italian" ;;
-      *"[7]"*)  SRC_URL="https://iptv-org.github.io/iptv/languages/por.m3u"; SRC_FILE="$TV_DIR/global-por.m3u"; LANG_LABEL="Portuguese" ;;
-      *"[8]"*)  SRC_URL="https://iptv-org.github.io/iptv/languages/rus.m3u"; SRC_FILE="$TV_DIR/global-rus.m3u"; LANG_LABEL="Russian" ;;
-      *"[9]"*)  SRC_URL="https://iptv-org.github.io/iptv/languages/ara.m3u"; SRC_FILE="$TV_DIR/global-ara.m3u"; LANG_LABEL="Arabic" ;;
-      *"[10]"*) SRC_URL="https://iptv-org.github.io/iptv/languages/zho.m3u"; SRC_FILE="$TV_DIR/global-zho.m3u"; LANG_LABEL="Chinese" ;;
-      *"[11]"*) SRC_URL="https://iptv-org.github.io/iptv/languages/jpn.m3u"; SRC_FILE="$TV_DIR/global-jpn.m3u"; LANG_LABEL="Japanese" ;;
-      *"[12]"*) SRC_URL="https://iptv-org.github.io/iptv/languages/kor.m3u"; SRC_FILE="$TV_DIR/global-kor.m3u"; LANG_LABEL="Korean" ;;
-      *"[13]"*) SRC_URL="https://iptv-org.github.io/iptv/languages/hin.m3u"; SRC_FILE="$TV_DIR/global-hin.m3u"; LANG_LABEL="Hindi" ;;
-      *"[14]"*) return ;;
-      *) continue ;;
-    esac
-    echo ">>> Loading $LANG_LABEL..."
-    curl -sS -L "$SRC_URL" -o "$SRC_FILE" || { echo "Failed."; read -rp "ENTER..." _; continue; }
-    local TMP
-    TMP=$(mktemp)
-    iptv_build_tmp_from_playlist "$SRC_FILE" "$TMP"
-    iptv_menu_clickable "$TMP" "$LANG_LABEL"
-    rm -f "$TMP"
-  done
 }
 
 iptv_search() {
   iptv_ensure_playlist "$GLOBAL_INDEX" "$GLOBAL_INDEX_URL" "global index"
-  local TMP
+  local TMP S_TMP
   TMP=$(mktemp)
   iptv_build_tmp_from_playlist "$GLOBAL_INDEX" "$TMP"
 
   clear
   echo "╔════════════════════════════════════════╗"
-  echo "║ TV ▸ Global ▸ Search                   ║"
+  printf "║ 🔍  TV ▸ Global ▸ Search   %-10s ║\n" "$(clock12)"
   echo "╚════════════════════════════════════════╝"
   read -rp "Search term: " Q
-  [ -z "$Q" ] && { rm -f "$TMP"; return; }
+  [ -z "${Q:-}" ] && { rm -f "$TMP"; return; }
 
-  local S_TMP
   S_TMP=$(mktemp)
   while IFS=$'\t' read -r name url; do
     if printf '%s\n' "$name" | grep -iF -- "$Q" >/dev/null 2>&1; then
@@ -1012,119 +1048,236 @@ iptv_search() {
     read -rp "ENTER..." _
     return
   fi
+
   iptv_menu_clickable "$S_TMP" "search: $Q"
   rm -f "$TMP" "$S_TMP"
 }
 
-iptv_top_menu() {
-  while true; do
-    if ! command -v fzf >/dev/null 2>&1; then
-      echo "fzf needed for clickable global menu."
-      read -rp "ENTER..." _
-      return
-    fi
-    local choice
-    choice=$(
-      printf '%s\n' \
-        "[1] 📺 US main list" \
-        "[2] 🌍 Global by language" \
-        "[3] 🔍 Global search" \
-        "[4] ⬅ Back" |
-      fzf --ansi \
-          --prompt="TV ▸ Global > " \
-          --header="Pick a global mode" \
-          --height=100% --reverse --border
-    )
-    [ -z "$choice" ] && return
-    case "$choice" in
-      *"[1]"*) iptv_main_us ;;
-      *"[2]"*) iptv_global_language_menu ;;
-      *"[3]"*) iptv_search ;;
-      *"[4]"*) return ;;
-    esac
-  done
+build_1080_db() {
+  iptv_ensure_playlist "$GLOBAL_INDEX" "$GLOBAL_INDEX_URL" "global index"
+  : > "$HD1080_DB"
+  python3 - "$GLOBAL_INDEX" "$HD1080_DB" << 'PY'
+import sys, re
+
+src, outp = sys.argv[1], sys.argv[2]
+
+# category keywords (simple + effective; you can expand anytime)
+CATS = [
+  ("📰 News", ["news","cnn","bbc","bloomberg","al jazeera","cnbc","fox news","msnbc","sky news"]),
+  ("🏈 Sports", ["sport","espn","nba","nfl","mlb","nhl","ufc","f1","formula","bein","tnt sports"]),
+  ("🎬 Movies", ["movie","cinema","hbo","starz","showtime","amc","tcm"]),
+  ("🧒 Kids", ["kids","cartoon","nick","disney","baby","family"]),
+  ("🎵 Music", ["music","mtv","hits","radio"]),
+  ("🧠 Docs", ["discovery","history","national geographic","nat geo","animal","science","documentary"]),
+  ("🧳 Travel/Food", ["travel","food","cooking","kitchen"]),
+]
+
+def cat_for(name):
+  low = name.lower()
+  for cat, keys in CATS:
+    for k in keys:
+      if k in low:
+        return cat
+  return "📺 General"
+
+name=None
+rows=[]
+with open(src,"r",encoding="utf-8",errors="ignore") as f:
+  for line in f:
+    line=line.strip()
+    if line.startswith("#EXTINF"):
+      name=line.split(",",1)[-1].strip()
+    elif line.startswith("http"):
+      if not name: 
+        name="Unknown"
+      # match 1080p/1080
+      low=name.lower()
+      if ("1080" in low) or ("1080p" in low):
+        rows.append((name,line,cat_for(name)))
+      name=None
+
+# de-dupe by (name,url)
+seen=set()
+out=[]
+for n,u,c in rows:
+  key=(n,u)
+  if key in seen: 
+    continue
+  seen.add(key)
+  out.append((c,n,u))
+
+out.sort(key=lambda t:(t[0], t[1].lower()))
+with open(outp,"w",encoding="utf-8") as o:
+  for c,n,u in out:
+    o.write(f"{n}\t{u}\t{c}\n")
+PY
+}
+
+hd1080_menu() {
+  build_1080_db
+  if [ ! -s "$HD1080_DB" ]; then
+    echo "No 1080p channels found."
+    read -rp "ENTER..." _
+    return
+  fi
+
+  local cat
+  cat=$(
+    (cut -f3 "$HD1080_DB" | sort -u; echo "⬅ Back") |
+    fzf --ansi --prompt="TV ▸ 1080p HDTV ▸ Category ($(clock12)) > " --height=60% --reverse --border
+  ) || true
+  [ -z "${cat:-}" ] && return
+  echo "$cat" | grep -q "⬅ Back" && return
+
+  local TMP pick idx
+  TMP=$(mktemp)
+  awk -F'\t' -v c="$cat" '$3==c{print $1 "\t" $2}' "$HD1080_DB" > "$TMP"
+
+  pick=$(
+    (awk -F'\t' '{printf "[%4d] 📺 %s\n", NR, $1}' "$TMP"; echo "[----] ⬅ Back") |
+    fzf --ansi --prompt="1080p HDTV ▸ $cat ($(clock12)) > " --height=100% --reverse --border
+  ) || true
+  [ -z "${pick:-}" ] && { rm -f "$TMP"; return; }
+  echo "$pick" | grep -q "⬅ Back" && { rm -f "$TMP"; return; }
+  idx=$(echo "$pick" | sed 's/^\[\s*\([0-9]\+\)\].*/\1/' || true)
+  [ -z "${idx:-}" ] && { rm -f "$TMP"; return; }
+
+  # Play via a 2-col temp as iptv_play_channel expects: name \t url
+  local PLAYTMP
+  PLAYTMP=$(mktemp)
+  awk -F'\t' -v i="$idx" 'NR==i{print $1 "\t" $2}' "$TMP" > "$PLAYTMP"
+  # hack: reuse iptv_play_channel by expanding single-row list into a table
+  # easiest: just play directly
+  local NAME URL
+  NAME=$(awk -F'\t' -v i="$idx" 'NR==i{print $1}' "$TMP")
+  URL=$(awk -F'\t' -v i="$idx" 'NR==i{print $2}' "$TMP")
+  rm -f "$PLAYTMP" "$TMP"
+  [ -z "${URL:-}" ] && return
+  mpv --fullscreen --input-conf="$INPUT_CONF" "$URL"
 }
 
 #########################################
-# QUICK GUIDE LIST (G)
+# RECORDINGS FOLDER
 #########################################
-guide_mode() {
-  clear
-  echo "╔════════════════════════════════════════╗"
-  echo "║ TV ▸ TVpass ▸ Quick Guide              ║"
-  echo "╚════════════════════════════════════════╝"
-  echo
-  if [ -f "$GUIDE_CACHE" ]; then
-    cat "$GUIDE_CACHE"
+open_recordings() {
+  echo ">>> Opening $RECDIR"
+  if command -v thunar >/dev/null 2>&1; then
+    thunar "$RECDIR" >/dev/null 2>&1 &
+  elif command -v xdg-open >/dev/null 2>&1; then
+    xdg-open "$RECDIR" >/dev/null 2>&1 &
   else
-    echo "No guide cache."
+    echo "Open manually: $RECDIR"
   fi
-  echo
-  read -rp "Channel # (or ENTER): " choice
-  if [ -n "$choice" ] && printf '%s\n' "$choice" | grep -Eq '^[0-9]+$'; then
-    play_channel "$choice" "$TABLE"
-  fi
+  read -rp "ENTER..." _
 }
 
 #########################################
-# MAIN CLICKABLE MENU
+# MAIN MENU (CLICKABLE + BACK SAFE)
 #########################################
 main_menu_clickable() {
   while true; do
-    if ! command -v fzf >/dev/null 2>&1; then
-      # fallback: text prompt
-      clear
-      echo "TV Main Menu (fzf missing)"
-      echo "1) TVpass Channels"
-      echo "2) Quick Guide"
-      echo "3) Global"
-      echo "4) Recordings"
-      echo "5) Timers list"
-      echo "6) Timers scan"
-      echo "7) Quit"
-      read -rp "> " ch
-      case "$ch" in
-        1) SEL=$(choose_channel_clickable "$TABLE") || true; [ -n "$SEL" ] && play_channel "$SEL" "$TABLE" ;;
-        2) guide_mode ;;
-        3) iptv_top_menu ;;
-        4) open_recordings ;;
-        5) clear; timers_list; read -rp "ENTER..." _ ;;
-        6) clear; timers_scan; read -rp "ENTER..." _ ;;
-        7) break ;;
-      esac
-      continue
-    fi
-
     local choice
     choice=$(
       printf '%s\n' \
         "[1] 📺  TVpass Channels" \
-        "[2] 🗓️  Quick Guide" \
-        "[3] 🌍  Global Channels" \
-        "[4] 📂  Recordings" \
-        "[5] ⏱️  Timers (list)" \
-        "[6] 🔁  Timers (scan EPG)" \
-        "[7] ❌  Quit" |
+        "[2] 🗓️  Quick Guide (click to play)" \
+        "[3] 📆  Channel Guide (24h + record)" \
+        "[4] 🌍  Global Channels" \
+        "[5] 🛰️  1080p HDTV (auto-categorized)" \
+        "[6] 📂  Recordings" \
+        "[7] ⏱️  Timers (list)" \
+        "[8] 🔁  Timers (scan EPG)" \
+        "[9] ❌  Quit" |
       fzf --ansi \
-          --prompt="TV ▸ Main > " \
-          --header="Use mouse or arrows, ENTER to select" \
+          --prompt="TV ▸ Main ($(clock12)) > " \
+          --header="Mouse/arrows: move • ENTER: select • ESC: quit" \
           --height=100% --reverse --border
-    )
-    [ -z "$choice" ] && break
+    ) || true
+    [ -z "${choice:-}" ] && break
+
     case "$choice" in
-      *"[1]"*) SEL=$(choose_channel_clickable "$TABLE") || true; [ -n "$SEL" ] && play_channel "$SEL" "$TABLE" ;;
-      *"[2]"*) guide_mode ;;
-      *"[3]"*) iptv_top_menu ;;
-      *"[4]"*) open_recordings ;;
-      *"[5]"*) clear; echo "╔══════════════════╗"; echo "║ TV ▸ Timers ▸ List║"; echo "╚══════════════════╝"; timers_list; read -rp "ENTER..." _ ;;
-      *"[6]"*) clear; echo "╔══════════════════════╗"; echo "║ TV ▸ Timers ▸ ScanEPG║"; echo "╚══════════════════════╝"; timers_scan; read -rp "ENTER..." _ ;;
-      *"[7]"*) break ;;
+      *"[1]"*)
+        SEL=$(choose_tvpass_channel "$TABLE") || true
+        [ -n "${SEL:-}" ] && play_channel "$SEL" "$TABLE"
+        ;;
+      *"[2]"*)
+        quick_guide_clickable
+        ;;
+      *"[3]"*)
+        # pick channel first, then show 24h guide
+        SEL=$(choose_tvpass_channel "$TABLE") || true
+        [ -n "${SEL:-}" ] && channel_guide_24h "$SEL" "$TABLE"
+        ;;
+      *"[4]"*)
+        # global: by language OR search
+        local g
+        g=$(
+          printf "%s\n" \
+            "🌍 Global by language" \
+            "🔍 Global search" \
+            "⬅ Back" |
+          fzf --ansi --prompt="TV ▸ Global ($(clock12)) > " --height=60% --reverse --border
+        ) || true
+        [ -z "${g:-}" ] && continue
+        echo "$g" | grep -q "⬅ Back" && continue
+
+        case "$g" in
+          *language*)
+            # minimal language menu (keep your old behavior; add back row)
+            local choice2 SRC_URL SRC_FILE LABEL TMP
+            choice2=$(
+              printf '%s\n' \
+                "🌍 All languages" \
+                "🇺🇸 English" \
+                "🇪🇸 Spanish" \
+                "🇫🇷 French" \
+                "🇩🇪 German" \
+                "⬅ Back" |
+              fzf --ansi --prompt="Global ▸ Language ($(clock12)) > " --height=60% --reverse --border
+            ) || true
+            [ -z "${choice2:-}" ] && continue
+            echo "$choice2" | grep -q "⬅ Back" && continue
+
+            case "$choice2" in
+              *All*) SRC_URL="$GLOBAL_INDEX_URL"; SRC_FILE="$GLOBAL_INDEX"; LABEL="All" ;;
+              *English*) SRC_URL="https://iptv-org.github.io/iptv/languages/eng.m3u"; SRC_FILE="$TV_DIR/global-eng.m3u"; LABEL="English" ;;
+              *Spanish*) SRC_URL="https://iptv-org.github.io/iptv/languages/spa.m3u"; SRC_FILE="$TV_DIR/global-spa.m3u"; LABEL="Spanish" ;;
+              *French*) SRC_URL="https://iptv-org.github.io/iptv/languages/fra.m3u"; SRC_FILE="$TV_DIR/global-fra.m3u"; LABEL="French" ;;
+              *German*) SRC_URL="https://iptv-org.github.io/iptv/languages/deu.m3u"; SRC_FILE="$TV_DIR/global-deu.m3u"; LABEL="German" ;;
+            esac
+
+            curl -sS -L "$SRC_URL" -o "$SRC_FILE" || { echo "Failed."; read -rp "ENTER..." _; continue; }
+            TMP=$(mktemp)
+            iptv_build_tmp_from_playlist "$SRC_FILE" "$TMP"
+            iptv_menu_clickable "$TMP" "$LABEL"
+            rm -f "$TMP"
+            ;;
+          *search*)
+            iptv_search
+            ;;
+        esac
+        ;;
+      *"[5]"*)
+        hd1080_menu
+        ;;
+      *"[6]"*)
+        open_recordings
+        ;;
+      *"[7]"*)
+        timers_list
+        ;;
+      *"[8]"*)
+        timers_scan
+        ;;
+      *"[9]"*)
+        break
+        ;;
     esac
   done
 }
 
 #########################################
-# ENTRYPOINT
+# ENTRY
 #########################################
 prevent_sleep
 ensure_deps
@@ -1133,31 +1286,17 @@ tvpass_ensure_playlist
 tvpass_ensure_guide
 detect_storage_tier
 
-case "$1" in
+case "${1:-}" in
   update) tvpass_update_all ;;
-  guide|G|g)
-    echo ">>> Building guide..."
-    TABLE=$(build_table)
-    build_guide_cache "$TABLE"
-    guide_mode
-    rm -f "$TABLE"
-    exit 0
-    ;;
-  timers-scan) timers_scan; exit 0 ;;
-  timers-list) timers_list; exit 0 ;;
 esac
 
-show_disclaimer
-
-echo ">>> Building TVpass channel table + guide..."
+# Build TVpass table + caches
 TABLE=$(build_table)
-build_guide_cache "$TABLE"
+build_epg_caches_and_quickguide "$TABLE"
 
+# Prime global caches (best-effort; don't fail if offline)
 iptv_ensure_playlist "$MAIN_PLAYLIST" "$MAIN_URL" "US main" >/dev/null 2>&1 || true
 iptv_ensure_playlist "$GLOBAL_INDEX" "$GLOBAL_INDEX_URL" "global index" >/dev/null 2>&1 || true
-
-echo "Storage: $STORAGE_TIER | background recordings: $MAX_BG_RECORDINGS | live: $MAX_LIVE_RECORDINGS"
-sleep 1
 
 main_menu_clickable
 
@@ -1165,5 +1304,19 @@ rm -f "$TABLE"
 TVEOF
 
 chmod +x "$HOME/.local/bin/tv"
-echo ">>> TV 4.1 installed. Run: tv"
+
+# ----------------------------
+# 6) Restore recordings from backup into the new ~/TV (optional but helpful)
+# ----------------------------
+mkdir -p "$HOME/TV/recordings"
+if [ -d "$BACKUP_DIR/recordings" ]; then
+  echo ">>> Restoring recordings from backup into new install..."
+  cp -a "$BACKUP_DIR/recordings/." "$HOME/TV/recordings/" 2>/dev/null || true
+fi
+
+echo "============================================"
+echo " DONE."
+echo " Backup saved at: $BACKUP_DIR"
+echo " Run TV with: tv"
+echo "============================================"
 EOF
